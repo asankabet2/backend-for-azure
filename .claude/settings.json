@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"try { require\\('./routes/tender.routes'\\); require\\('./app'\\); console.log\\('OK'\\); } catch \\(e\\) { console.error\\('ERR:', e.message\\); }\")"
+    ]
+  }
+}
