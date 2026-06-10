@@ -8,6 +8,7 @@ const { getPool, sql }  = require('../db/procurement');
 const { createNotification, getAdminUserIds, getSupplierUserId } = require('../helpers/notifications');
 const { generateId } = require('../utils/idGenerator');
 const { logAudit } = require('../helpers/audit');
+const { sendTemplatedEmail } = require('../helpers/mailers');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTE ORDER (important — Express matches top-to-bottom):
@@ -211,16 +212,47 @@ router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
 });
 
 
-// ── 4. POST /api/bids  — submit a bid 
 router.post('/', requireAuth, async (req, res) => {
     const { bidId, tenderId, supplierId, grandTotal, submittedDate, items } = req.body;
 
+    // ── 1. Required fields ────────────────────────────────────────────────────
     if (!bidId || !tenderId || !supplierId)
         return res.status(400).json({ message: 'bidId, tenderId, and supplierId are required' });
+
+    // ── 2. Prevent supplierId tampering ───────────────────────────────────────
+    if (supplierId !== req.user.userId)
+        return res.status(403).json({ message: 'You can only submit bids for your own account' });
 
     try {
         const pool = await getPool();
 
+        // ── 3. Tender existence + Open status ─────────────────────────────────
+        const tenderInfo = await pool.request()
+            .input('tenderId', sql.VarChar(50), tenderId)
+            .query(`SELECT Title, TenderStatusID FROM Tender WHERE TenderID = @tenderId`);
+
+        if (tenderInfo.recordset.length === 0)
+            return res.status(404).json({ message: 'Tender not found' });
+
+        const tenderRow = tenderInfo.recordset[0];
+
+        if (tenderRow.TenderStatusID !== 'TS002')
+            return res.status(400).json({ message: 'This tender is not open for bidding' });
+
+        const tenderTitle = tenderRow.Title || 'a tender';
+
+        // ── 4. Supplier info ───────────────────────────────────────────────────
+        const supplierInfo = await pool.request()
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`SELECT CompanyName, Email FROM SupplierProfile WHERE SupplierID = @supplierId`);
+
+        if (supplierInfo.recordset.length === 0)
+            return res.status(404).json({ message: 'Supplier profile not found' });
+
+        const companyName   = supplierInfo.recordset[0].CompanyName || 'A supplier';
+        const supplierEmail = supplierInfo.recordset[0].Email       || null;
+
+        // ── 5. Interest check ─────────────────────────────────────────────────
         const interestCheck = await pool.request()
             .input('tenderId',   sql.VarChar(50), tenderId)
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -229,6 +261,7 @@ router.post('/', requireAuth, async (req, res) => {
         if (interestCheck.recordset.length === 0)
             return res.status(403).json({ message: 'You must express interest in this tender before submitting a bid' });
 
+        // ── 6. Duplicate bid check ────────────────────────────────────────────
         const existingBid = await pool.request()
             .input('tenderId',   sql.VarChar(50), tenderId)
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -237,17 +270,74 @@ router.post('/', requireAuth, async (req, res) => {
         if (existingBid.recordset.length > 0)
             return res.status(400).json({ message: 'You have already submitted a bid for this tender' });
 
-        const tenderInfo = await pool.request()
-            .input('tenderId', sql.VarChar(50), tenderId)
-            .query(`SELECT Title FROM Tender WHERE TenderID = @tenderId`);
-
-        const supplierInfo = await pool.request()
+        // ── 7. Supplier compliance — no expired documents ─────────────────────
+        const today = new Date().toISOString().split('T')[0];
+        const complianceCheck = await pool.request()
             .input('supplierId', sql.VarChar(50), supplierId)
-            .query(`SELECT CompanyName FROM SupplierProfile WHERE SupplierID = @supplierId`);
+            .input('today',      sql.VarChar(10), today)
+            .query(`
+                SELECT d.[value] AS doc
+                FROM SupplierProfile sp
+                CROSS APPLY OPENJSON(sp.Documents) d
+                WHERE sp.SupplierID = @supplierId
+                  AND JSON_VALUE(d.[value], '$.requiresExpiry') = 'true'
+                  AND JSON_VALUE(d.[value], '$.expiryDate')     < @today
+                  AND JSON_VALUE(d.[value], '$.status')         = 'Verified'
+            `);
 
-        const tenderTitle = tenderInfo.recordset[0]?.Title        || 'a tender';
-        const companyName = supplierInfo.recordset[0]?.CompanyName || 'A supplier';
+        if (complianceCheck.recordset.length > 0)
+            return res.status(403).json({ message: 'You have expired documents. Please renew them before submitting a bid.' });
 
+        // ── 8. Items present + no duplicate tenderItemIds ─────────────────────
+        if (!items || items.length === 0)
+            return res.status(400).json({ message: 'At least one item is required' });
+
+        const submittedItemIds = items.map(i => i.tenderItemId);
+        const uniqueItemIds    = new Set(submittedItemIds);
+        if (uniqueItemIds.size !== submittedItemIds.length)
+            return res.status(400).json({ message: 'Duplicate items in bid submission' });
+
+        // ── 9. Fetch tender items and validate quantities ──────────────────────
+        const tenderItemsRes = await pool.request()
+            .input('tenderId', sql.VarChar(50), tenderId)
+            .query(`SELECT TenderItemID, ItemNo, Quantity FROM TenderItem WHERE TenderID = @tenderId`);
+
+        const tenderItemMap = Object.fromEntries(
+            tenderItemsRes.recordset.map(ti => [ti.TenderItemID, ti])
+        );
+
+        // Ensure all submitted tenderItemIds actually belong to this tender
+        const unknownItems = items.filter(i => !tenderItemMap[i.tenderItemId]);
+        if (unknownItems.length > 0)
+            return res.status(400).json({
+                message: `Item(s) ${unknownItems.map(i => i.itemNo).join(', ')} do not belong to this tender`,
+            });
+
+        // ── 10. Quantity and unit price validation ────────────────────────────
+        const invalidItems = items.filter(i => i.quantity <= 0 || i.unitPrice <= 0);
+        if (invalidItems.length > 0)
+            return res.status(400).json({
+                message: `Item(s) ${invalidItems.map(i => i.itemNo).join(', ')} have invalid quantity or unit price`,
+            });
+
+        const overQuantityItems = items.filter(i => {
+            const tenderItem = tenderItemMap[i.tenderItemId];
+            return i.quantity > tenderItem.Quantity;
+        });
+        if (overQuantityItems.length > 0)
+            return res.status(400).json({
+                message: `Bid quantity exceeds requested quantity for item(s): ${overQuantityItems.map(i => i.itemNo).join(', ')}`,
+            });
+
+        // ── 11. Grand total integrity ─────────────────────────────────────────
+        const computedGrandTotal = items.reduce((sum, i) => {
+            return sum + (parseFloat(i.quantity) * parseFloat(i.unitPrice));
+        }, 0);
+
+        if (Math.abs(computedGrandTotal - grandTotal) > 0.01)
+            return res.status(400).json({ message: 'Grand total does not match sum of item totals' });
+
+        // ── 12. Transaction: insert Bid + BidItems ────────────────────────────
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
@@ -256,36 +346,36 @@ router.post('/', requireAuth, async (req, res) => {
                 .input('bidId',         sql.VarChar(50),    bidId)
                 .input('tenderId',      sql.VarChar(50),    tenderId)
                 .input('supplierId',    sql.VarChar(50),    supplierId)
-                .input('submittedDate', sql.Date,           submittedDate || new Date().toISOString().split('T')[0])
-                .input('grandTotal',    sql.Decimal(18, 2), grandTotal || 0)
+                .input('submittedDate', sql.Date,           submittedDate || today)
+                .input('grandTotal',    sql.Decimal(18, 2), computedGrandTotal)
                 .input('bidStatusId',   sql.VarChar(20),    'BS001')
                 .query(`
                     INSERT INTO Bid (BidID, TenderID, SupplierID, SubmittedDate, GrandTotal, BidStatusID, CreatedAt)
                     VALUES (@bidId, @tenderId, @supplierId, @submittedDate, @grandTotal, @bidStatusId, GETDATE())
                 `);
 
-            if (items && items.length > 0) {
-                for (const item of items) {
-                    await transaction.request()
-                        .input('bidId',        sql.VarChar(50),       bidId)
-                        .input('itemNo',       sql.Int,               item.itemNo)
-                        .input('description',  sql.NVarChar(sql.MAX), item.description  || '')
-                        .input('unit',         sql.NVarChar(50),      item.unit         || '')
-                        .input('quantity',     sql.Decimal(18, 2),    item.quantity     || 0)
-                        .input('unitPrice',    sql.Decimal(18, 2),    item.unitPrice    || 0)
-                        .input('total',        sql.Decimal(18, 2),    item.total        || 0)
-                        .input('tenderItemId', sql.VarChar(50),       item.tenderItemId || '')
-                        .query(`
-                            INSERT INTO BidItem
-                                (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt, TenderItemID)
-                            VALUES
-                                (@bidId, @itemNo, @description, @unit, @quantity, @unitPrice, @total, GETDATE(), @tenderItemId)
-                        `);
-                }
+            for (const item of items) {
+                const itemTotal = parseFloat(item.quantity) * parseFloat(item.unitPrice);
+                await transaction.request()
+                    .input('bidId',        sql.VarChar(50),       bidId)
+                    .input('itemNo',       sql.Int,               item.itemNo)
+                    .input('description',  sql.NVarChar(sql.MAX), item.description  || '')
+                    .input('unit',         sql.NVarChar(50),      item.unit         || '')
+                    .input('quantity',     sql.Decimal(18, 2),    item.quantity)
+                    .input('unitPrice',    sql.Decimal(18, 2),    item.unitPrice)
+                    .input('total',        sql.Decimal(18, 2),    itemTotal)
+                    .input('tenderItemId', sql.VarChar(50),       item.tenderItemId)
+                    .query(`
+                        INSERT INTO BidItem
+                            (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt, TenderItemID)
+                        VALUES
+                            (@bidId, @itemNo, @description, @unit, @quantity, @unitPrice, @total, GETDATE(), @tenderItemId)
+                    `);
             }
 
             await transaction.commit();
 
+            // ── Notify admins ─────────────────────────────────────────────────
             const adminIds = await getAdminUserIds(pool);
             for (const adminUserId of adminIds) {
                 await createNotification(pool, {
@@ -297,14 +387,32 @@ router.post('/', requireAuth, async (req, res) => {
                 });
             }
 
+            // ── Bid confirmation email ────────────────────────────────────────
+            try {
+                if (supplierEmail) {
+                    await sendTemplatedEmail(pool, sql, 'ETT004', supplierEmail, {
+                        supplierName:  companyName,
+                        tenderTitle,
+                        bidId,
+                        submittedDate: submittedDate || today,
+                        orgName:       process.env.ORG_NAME || 'Procurement Portal',
+                    });
+                }
+            } catch (mailErr) {
+                console.error('[mailer] Failed to send bid confirmation email:', mailErr.message);
+            }
+
+            // ── Audit log ─────────────────────────────────────────────────────
             await logAudit(pool, req, {
-                action: 'BID_SUBMIT', entityType: 'Bid', entityId: bidId,
-                description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${grandTotal || 0})`,
+                action:      'BID_SUBMIT',
+                entityType:  'Bid',
+                entityId:    bidId,
+                description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})`,
             });
 
             res.status(201).json({
                 message: 'Bid submitted successfully',
-                bid:     { bidId, tenderId, supplierId, grandTotal },
+                bid:     { bidId, tenderId, supplierId, grandTotal: computedGrandTotal },
             });
         } catch (error) {
             await transaction.rollback();
