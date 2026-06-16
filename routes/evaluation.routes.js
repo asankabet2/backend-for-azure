@@ -350,7 +350,7 @@ router.post('/:tenderId/panel', requireAdmin, async (req, res) => {
 // ── PUT /api/tenders/:tenderId/panel/:panelmemberId 
 router.put('/:tenderId/panel/:panelmemberId', requireAdmin, async (req, res) => {
     const { tenderId, panelmemberId } = req.params;
-    const { designation, department, role, status } = req.body;  y
+    const { designation, department, role, status } = req.body;  
 
     // Get the existing member to fetch their name and MemberID
     try {
