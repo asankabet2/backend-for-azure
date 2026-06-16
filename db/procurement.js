@@ -1,10 +1,17 @@
-const sql = require('mssql/msnodesqlv8');
-
+const sql = require('mssql');
 
 const config = {
-    connectionString: 'Driver={ODBC Driver 18 for SQL Server};Server=localhost;Database=PROCUREMENTDB;Trusted_Connection=yes;TrustServerCertificate=yes;',
+    server:   process.env.DB_SERVER,
+    database: process.env.DB_NAME,
+    user:     process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    port:     parseInt(process.env.DB_PORT) || 1433,
+    options: {
+        encrypt:                true,   // required for Azure
+        trustServerCertificate: false,
+    },
     connectionTimeout: 30000,
-    requestTimeout: 30000
+    requestTimeout:    30000,
 };
 
 let pool = null;
@@ -13,7 +20,7 @@ async function getPool() {
     try {
         if (!pool) {
             pool = await sql.connect(config);
-            console.log('[SQL Server] Connected successfully to PROCUREMENTDB');
+            console.log('[SQL Server] Connected successfully to', process.env.DB_NAME);
         }
         return pool;
     } catch (err) {

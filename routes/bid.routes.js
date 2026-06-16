@@ -3,12 +3,13 @@
 const express    = require('express');
 const router     = express.Router();
 
-const { requireAuth, requireAdmin } = require('../middleware/auth');
-const { getPool, sql }  = require('../db/procurement');
+const { requireAuth, requireAdmin }   = require('../middleware/auth');
+const { getPool, sql }                = require('../db/procurement');
 const { createNotification, getAdminUserIds, getSupplierUserId } = require('../helpers/notifications');
-const { generateId } = require('../utils/idGenerator');
-const { logAudit } = require('../helpers/audit');
-const { sendTemplatedEmail } = require('../helpers/mailers');
+const { generateId }                  = require('../utils/idGenerator');
+const { logAudit }                    = require('../helpers/audit');
+const { sendTemplatedEmail }          = require('../helpers/mailers');
+const { checkAwardEligibility }       = require('../helpers/evaluationHelpers');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTE ORDER (important — Express matches top-to-bottom):
@@ -22,7 +23,7 @@ const { sendTemplatedEmail } = require('../helpers/mailers');
 // ─────────────────────────────────────────────────────────────────────────────
 
 
-// ── 1. GET /api/bids  — admin: all bids 
+// ── 1. GET /api/bids  — admin: all bids
 router.get('/', requireAdmin, async (req, res) => {
     try {
         const pool   = await getPool();
@@ -70,7 +71,7 @@ router.get('/', requireAdmin, async (req, res) => {
 });
 
 
-// ── 2. GET /api/bids/tender/:tenderId  — admin: bids for a specific tender 
+// ── 2. GET /api/bids/tender/:tenderId  — admin: bids for a specific tender
 router.get('/tender/:tenderId', requireAdmin, async (req, res) => {
     const { tenderId } = req.params;
     try {
@@ -99,7 +100,6 @@ router.get('/tender/:tenderId', requireAdmin, async (req, res) => {
         const bids = bidsResult.recordset;
 
         if (bids.length > 0) {
-
             const itemsRequest = pool.request();
             const placeholders = bids.map((b, i) => {
                 itemsRequest.input(`bid${i}`, sql.VarChar(50), b.bidId);
@@ -133,12 +133,11 @@ router.get('/tender/:tenderId', requireAdmin, async (req, res) => {
 });
 
 
-// ── 3. GET /api/bids/supplier/:supplierId  — supplier: their own bids 
+// ── 3. GET /api/bids/supplier/:supplierId  — supplier: their own bids
 router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
     const { supplierId }   = req.params;
     const { userId, role } = req.user;
 
-    //  suppliers must only be able to fetch their own bids
     if (role === 'supplier' && userId !== supplierId)
         return res.status(403).json({ message: 'You can only view your own bids' });
 
@@ -170,7 +169,6 @@ router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
         const bids = bidsResult.recordset;
 
         if (bids.length > 0) {
-
             const itemsRequest = pool.request();
             const placeholders = bids.map((b, i) => {
                 itemsRequest.input(`bid${i}`, sql.VarChar(50), b.bidId);
@@ -212,21 +210,19 @@ router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
 });
 
 
+// ── 4. POST /api/bids  — submit a bid
 router.post('/', requireAuth, async (req, res) => {
     const { bidId, tenderId, supplierId, grandTotal, submittedDate, items } = req.body;
 
-    // ── 1. Required fields ────────────────────────────────────────────────────
     if (!bidId || !tenderId || !supplierId)
         return res.status(400).json({ message: 'bidId, tenderId, and supplierId are required' });
 
-    // ── 2. Prevent supplierId tampering ───────────────────────────────────────
     if (supplierId !== req.user.userId)
         return res.status(403).json({ message: 'You can only submit bids for your own account' });
 
     try {
         const pool = await getPool();
 
-        // ── 3. Tender existence + Open status ─────────────────────────────────
         const tenderInfo = await pool.request()
             .input('tenderId', sql.VarChar(50), tenderId)
             .query(`SELECT Title, TenderStatusID FROM Tender WHERE TenderID = @tenderId`);
@@ -235,13 +231,11 @@ router.post('/', requireAuth, async (req, res) => {
             return res.status(404).json({ message: 'Tender not found' });
 
         const tenderRow = tenderInfo.recordset[0];
-
         if (tenderRow.TenderStatusID !== 'TS002')
             return res.status(400).json({ message: 'This tender is not open for bidding' });
 
         const tenderTitle = tenderRow.Title || 'a tender';
 
-        // ── 4. Supplier info ───────────────────────────────────────────────────
         const supplierInfo = await pool.request()
             .input('supplierId', sql.VarChar(50), supplierId)
             .query(`SELECT CompanyName, Email FROM SupplierProfile WHERE SupplierID = @supplierId`);
@@ -252,7 +246,6 @@ router.post('/', requireAuth, async (req, res) => {
         const companyName   = supplierInfo.recordset[0].CompanyName || 'A supplier';
         const supplierEmail = supplierInfo.recordset[0].Email       || null;
 
-        // ── 5. Interest check ─────────────────────────────────────────────────
         const interestCheck = await pool.request()
             .input('tenderId',   sql.VarChar(50), tenderId)
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -261,7 +254,6 @@ router.post('/', requireAuth, async (req, res) => {
         if (interestCheck.recordset.length === 0)
             return res.status(403).json({ message: 'You must express interest in this tender before submitting a bid' });
 
-        // ── 6. Duplicate bid check ────────────────────────────────────────────
         const existingBid = await pool.request()
             .input('tenderId',   sql.VarChar(50), tenderId)
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -270,7 +262,6 @@ router.post('/', requireAuth, async (req, res) => {
         if (existingBid.recordset.length > 0)
             return res.status(400).json({ message: 'You have already submitted a bid for this tender' });
 
-        // ── 7. Supplier compliance — no expired documents ─────────────────────
         const today = new Date().toISOString().split('T')[0];
         const complianceCheck = await pool.request()
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -288,7 +279,6 @@ router.post('/', requireAuth, async (req, res) => {
         if (complianceCheck.recordset.length > 0)
             return res.status(403).json({ message: 'You have expired documents. Please renew them before submitting a bid.' });
 
-        // ── 8. Items present + no duplicate tenderItemIds ─────────────────────
         if (!items || items.length === 0)
             return res.status(400).json({ message: 'At least one item is required' });
 
@@ -297,7 +287,6 @@ router.post('/', requireAuth, async (req, res) => {
         if (uniqueItemIds.size !== submittedItemIds.length)
             return res.status(400).json({ message: 'Duplicate items in bid submission' });
 
-        // ── 9. Fetch tender items and validate quantities ──────────────────────
         const tenderItemsRes = await pool.request()
             .input('tenderId', sql.VarChar(50), tenderId)
             .query(`SELECT TenderItemID, ItemNo, Quantity FROM TenderItem WHERE TenderID = @tenderId`);
@@ -306,14 +295,12 @@ router.post('/', requireAuth, async (req, res) => {
             tenderItemsRes.recordset.map(ti => [ti.TenderItemID, ti])
         );
 
-        // Ensure all submitted tenderItemIds actually belong to this tender
         const unknownItems = items.filter(i => !tenderItemMap[i.tenderItemId]);
         if (unknownItems.length > 0)
             return res.status(400).json({
                 message: `Item(s) ${unknownItems.map(i => i.itemNo).join(', ')} do not belong to this tender`,
             });
 
-        // ── 10. Quantity and unit price validation ────────────────────────────
         const invalidItems = items.filter(i => i.quantity <= 0 || i.unitPrice <= 0);
         if (invalidItems.length > 0)
             return res.status(400).json({
@@ -329,15 +316,10 @@ router.post('/', requireAuth, async (req, res) => {
                 message: `Bid quantity exceeds requested quantity for item(s): ${overQuantityItems.map(i => i.itemNo).join(', ')}`,
             });
 
-        // ── 11. Grand total integrity ─────────────────────────────────────────
-        const computedGrandTotal = items.reduce((sum, i) => {
-            return sum + (parseFloat(i.quantity) * parseFloat(i.unitPrice));
-        }, 0);
-
+        const computedGrandTotal = items.reduce((sum, i) => sum + (parseFloat(i.quantity) * parseFloat(i.unitPrice)), 0);
         if (Math.abs(computedGrandTotal - grandTotal) > 0.01)
             return res.status(400).json({ message: 'Grand total does not match sum of item totals' });
 
-        // ── 12. Transaction: insert Bid + BidItems ────────────────────────────
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
@@ -375,7 +357,6 @@ router.post('/', requireAuth, async (req, res) => {
 
             await transaction.commit();
 
-            // ── Notify admins ─────────────────────────────────────────────────
             const adminIds = await getAdminUserIds(pool);
             for (const adminUserId of adminIds) {
                 await createNotification(pool, {
@@ -387,7 +368,6 @@ router.post('/', requireAuth, async (req, res) => {
                 });
             }
 
-            // ── Bid confirmation email ────────────────────────────────────────
             try {
                 if (supplierEmail) {
                     await sendTemplatedEmail(pool, sql, 'ETT004', supplierEmail, {
@@ -402,11 +382,8 @@ router.post('/', requireAuth, async (req, res) => {
                 console.error('[mailer] Failed to send bid confirmation email:', mailErr.message);
             }
 
-            // ── Audit log ─────────────────────────────────────────────────────
             await logAudit(pool, req, {
-                action:      'BID_SUBMIT',
-                entityType:  'Bid',
-                entityId:    bidId,
+                action: 'BID_SUBMIT', entityType: 'Bid', entityId: bidId,
                 description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})`,
             });
 
@@ -425,7 +402,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 
-// ── 5. PATCH /api/bids/:id/status  — admin: award / reject 
+// ── 5. PATCH /api/bids/:id/status  — admin: award / reject
 router.patch('/:id/status', requireAdmin, async (req, res) => {
     const { id }           = req.params;
     const { status, note } = req.body;
@@ -440,7 +417,10 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
         const bidResult = await pool.request()
             .input('bidId', sql.VarChar(50), id)
             .query(`
-                SELECT b.*, t.Title AS tenderTitle, sp.CompanyName AS supplierName, bs.BidStatusName AS CurrentStatus
+                SELECT b.BidID, b.TenderID, b.SupplierID, b.GrandTotal,
+                       t.Title AS tenderTitle,
+                       sp.CompanyName AS supplierName, sp.Email AS supplierEmail,
+                       bs.BidStatusName AS CurrentStatus
                 FROM Bid b
                 JOIN Tender          t  ON b.TenderID   = t.TenderID
                 JOIN SupplierProfile sp ON b.SupplierID  = sp.SupplierID
@@ -455,101 +435,172 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
 
         if (bid.CurrentStatus === 'Awarded')
             return res.status(400).json({ message: 'Cannot modify a bid that has already been awarded.' });
-
         if (bid.CurrentStatus === 'Rejected')
             return res.status(400).json({ message: 'Cannot modify a bid that has already been rejected.' });
 
+        // ── Award gate — run all five eligibility checks ──────────────────────
         if (status === 'Awarded') {
-            const tenderResult = await pool.request()
+            const eligibility = await checkAwardEligibility(pool, sql, bid.TenderID);
+            if (!eligibility.eligible)
+                return res.status(400).json({ message: eligibility.reason });
+
+            // Additional check: the supplier being awarded must be responsive
+            if (!eligibility.responsiveSupplierIds.includes(bid.SupplierID))
+                return res.status(400).json({
+                    message: 'This supplier was found non-responsive during evaluation and cannot be awarded.',
+                });
+
+            // Load tender items and winning bid items for bulk award
+            const tenderItemsResult = await pool.request()
                 .input('tenderId', sql.VarChar(50), bid.TenderID)
                 .query(`
-                    SELECT TenderStatusName
-                    FROM TenderStatus ts
-                    JOIN Tender t ON ts.TenderStatusID = t.TenderStatusID
-                    WHERE t.TenderID = @tenderId
+                    SELECT TenderItemID, ItemNo, Description, Unit, Quantity, EstimatedUnitPrice
+                    FROM TenderItem
+                    WHERE TenderID = @tenderId
+                    ORDER BY ItemNo ASC
                 `);
 
-            const tenderStatus = tenderResult.recordset[0]?.TenderStatusName;
-            if (tenderStatus !== 'Closed')
-                return res.status(400).json({
-                    message: `Cannot award bid. Tender status is '${tenderStatus}'. A tender can only be awarded once it is Closed.`,
-                });
-        }
+            if (tenderItemsResult.recordset.length === 0)
+                return res.status(400).json({ message: 'This tender has no items to award.' });
 
-        const transaction = new sql.Transaction(pool);
-        await transaction.begin();
+            const bidItemsResult = await pool.request()
+                .input('bidId', sql.VarChar(50), id)
+                .query(`
+                    SELECT ItemNo, TenderItemID, Quantity, UnitPrice, Total
+                    FROM BidItem
+                    WHERE BidID = @bidId
+                `);
 
-        try {
-            if (status === 'Rejected') {
-                await transaction.request()
-                    .input('bidId',           sql.VarChar(50),       id)
-                    .input('bidStatusId',     sql.VarChar(20),       bidStatusId)
-                    .input('rejectionReason', sql.NVarChar(sql.MAX), note || null)
-                    .input('rejectedAt',      sql.DateTime,          new Date())
-                    .query(`
-                        UPDATE Bid SET
-                            BidStatusID     = @bidStatusId,
-                            RejectionReason = @rejectionReason,
-                            RejectedAt      = @rejectedAt
-                        WHERE BidID = @bidId
-                    `);
-            } else {
+            const bidItemMap = {};
+            bidItemsResult.recordset.forEach(bi => { bidItemMap[bi.ItemNo] = bi; });
+
+            const transaction = new sql.Transaction(pool);
+            await transaction.begin();
+
+            try {
+                // Award the winning bid
                 await transaction.request()
                     .input('bidId',       sql.VarChar(50), id)
                     .input('bidStatusId', sql.VarChar(20), bidStatusId)
                     .query(`UPDATE Bid SET BidStatusID = @bidStatusId WHERE BidID = @bidId`);
-            }
 
-            if (status === 'Awarded') {
+                // Clear any existing awards then bulk-insert one row per item
                 await transaction.request()
-                    .input('tenderId',    sql.VarChar(50),       bid.TenderID)
-                    .input('supplierId',  sql.VarChar(50),       bid.SupplierID)
-                    .input('awardAmount', sql.Decimal(18, 2),    bid.GrandTotal)
-                    .input('awardNote',   sql.NVarChar(sql.MAX), note || null)
+                    .input('tenderId', sql.VarChar(50), bid.TenderID)
+                    .query(`DELETE FROM TenderItemAward WHERE TenderID = @tenderId`);
+
+                for (const tenderItem of tenderItemsResult.recordset) {
+                    const bidItem   = bidItemMap[tenderItem.ItemNo];
+                    const qty       = bidItem ? Number(bidItem.Quantity)  : Number(tenderItem.Quantity);
+                    const unitPrice = bidItem ? Number(bidItem.UnitPrice) : Number(tenderItem.EstimatedUnitPrice);
+                    const total     = bidItem ? Number(bidItem.Total)     : qty * unitPrice;
+
+                    await transaction.request()
+                        .input('awardId',          sql.VarChar(50),       generateId('AWARD'))
+                        .input('tenderItemId',     sql.VarChar(50),       tenderItem.TenderItemID)
+                        .input('tenderId',         sql.VarChar(50),       bid.TenderID)
+                        .input('bidId',            sql.VarChar(50),       id)
+                        .input('supplierId',       sql.VarChar(50),       bid.SupplierID)
+                        .input('awardedQuantity',  sql.Decimal(18, 2),    qty)
+                        .input('awardedUnitPrice', sql.Decimal(18, 2),    unitPrice)
+                        .input('awardedTotal',     sql.Decimal(18, 2),    total)
+                        .input('awardNote',        sql.NVarChar(sql.MAX), note || null)
+                        .query(`
+                            INSERT INTO TenderItemAward (
+                                AwardID, TenderItemID, TenderID, BidID, SupplierID,
+                                AwardedQuantity, AwardedUnitPrice, AwardedTotal, AwardDate, AwardNote
+                            ) VALUES (
+                                @awardId, @tenderItemId, @tenderId, @bidId, @supplierId,
+                                @awardedQuantity, @awardedUnitPrice, @awardedTotal, GETDATE(), @awardNote
+                            )
+                        `);
+                }
+
+                // Flip tender to Awarded
+                await transaction.request()
+                    .input('tenderId', sql.VarChar(50), bid.TenderID)
                     .query(`
-                        UPDATE Tender SET
-                            TenderStatusID = 'TS004',
-                            AwardedTo      = @supplierId,
-                            AwardAmount    = @awardAmount,
-                            AwardDate      = GETDATE(),
-                            AwardNote      = @awardNote,
-                            UpdatedAt      = GETDATE()
+                        UPDATE Tender SET TenderStatusID = 'TS004', UpdatedAt = GETDATE()
                         WHERE TenderID = @tenderId
                     `);
+
+                // Auto-reject all other submitted bids
+                await transaction.request()
+                    .input('tenderId',   sql.VarChar(50), bid.TenderID)
+                    .input('winningBid', sql.VarChar(50), id)
+                    .query(`
+                        UPDATE Bid SET
+                            BidStatusID     = 'BS003',
+                            RejectionReason = 'Tender awarded to another supplier',
+                            RejectedAt      = GETDATE()
+                        WHERE TenderID   = @tenderId
+                          AND BidID     <> @winningBid
+                          AND BidStatusID = 'BS001'
+                    `);
+
+                await transaction.commit();
+            } catch (err) {
+                await transaction.rollback();
+                throw err;
             }
 
-            await transaction.commit();
-
-            const supplierUserId = await getSupplierUserId(pool, bid.SupplierID);
-            if (supplierUserId) {
-                let notificationMessage = status === 'Awarded'
-                    ? `Congratulations! Your bid for "${bid.tenderTitle}" has been awarded.`
-                    : `Your bid for "${bid.tenderTitle}" was not successful.${note ? ` Reason: ${note}` : ''}`;
-
-                await createNotification(pool, {
-                    userId:  supplierUserId,
-                    message: notificationMessage,
-                    type:    status === 'Awarded' ? 'success' : 'error',
-                    link:    '/supplier/bids',
-                });
-            }
-
-            await logAudit(pool, req, {
-                action: status === 'Awarded' ? 'BID_AWARD' : 'BID_REJECT',
-                entityType: 'Bid', entityId: id,
-                description: status === 'Awarded'
-                    ? `Awarded whole tender "${bid.tenderTitle}" to ${bid.supplierName} via bid ${id} (amount ${bid.GrandTotal})`
-                    : `Rejected bid ${id} from ${bid.supplierName} for "${bid.tenderTitle}"${note ? ` — reason: ${note}` : ''}`,
-            });
-
-            res.json({
-                message: `Bid ${status.toLowerCase()} successfully`,
-                bid:     { id, status, rejectionReason: status === 'Rejected' ? (note || null) : null },
-            });
-        } catch (error) {
-            await transaction.rollback();
-            throw error;
+        } else {
+            // Rejection — simple status update
+            await pool.request()
+                .input('bidId',           sql.VarChar(50),       id)
+                .input('bidStatusId',     sql.VarChar(20),       bidStatusId)
+                .input('rejectionReason', sql.NVarChar(sql.MAX), note || null)
+                .input('rejectedAt',      sql.DateTime,          new Date())
+                .query(`
+                    UPDATE Bid SET
+                        BidStatusID     = @bidStatusId,
+                        RejectionReason = @rejectionReason,
+                        RejectedAt      = @rejectedAt
+                    WHERE BidID = @bidId
+                `);
         }
+
+        // Notify the supplier
+        const supplierUserId = await getSupplierUserId(pool, bid.SupplierID);
+        if (supplierUserId) {
+            await createNotification(pool, {
+                userId:  supplierUserId,
+                message: status === 'Awarded'
+                    ? `Congratulations! Your bid for "${bid.tenderTitle}" has been awarded.`
+                    : `Your bid for "${bid.tenderTitle}" was not successful.${note ? ` Reason: ${note}` : ''}`,
+                type:    status === 'Awarded' ? 'success' : 'error',
+                link:    '/supplier/bids',
+            });
+        }
+
+        // Send award email
+        if (status === 'Awarded') {
+            try {
+                if (bid.supplierEmail) {
+                    await sendTemplatedEmail(pool, sql, 'ETT005', bid.supplierEmail, {
+                        supplierName: bid.supplierName,
+                        tenderTitle:  bid.tenderTitle,
+                        orgName:      process.env.ORG_NAME || 'Procurement Portal',
+                    });
+                }
+            } catch (mailErr) {
+                console.error('[mailer] Failed to send award email:', mailErr.message);
+            }
+        }
+
+        await logAudit(pool, req, {
+            action: status === 'Awarded' ? 'BID_AWARD' : 'BID_REJECT',
+            entityType: 'Bid', entityId: id,
+            description: status === 'Awarded'
+                ? `Bulk-awarded whole tender "${bid.tenderTitle}" to ${bid.supplierName} via bid ${id} (amount ${bid.GrandTotal})`
+                : `Rejected bid ${id} from ${bid.supplierName} for "${bid.tenderTitle}"${note ? ` — reason: ${note}` : ''}`,
+        });
+
+        res.json({
+            message: `Bid ${status.toLowerCase()} successfully`,
+            bid:     { id, status, rejectionReason: status === 'Rejected' ? (note || null) : null },
+        });
+
     } catch (error) {
         console.error('[PATCH /api/bids/:id/status] Error:', error);
         res.status(500).json({ message: error.message });
@@ -557,7 +608,7 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
 });
 
 
-// ── 6. GET /api/bids/:bidId/download  — PDF receipt 
+// ── 6. GET /api/bids/:bidId/download  — PDF receipt
 router.get('/:bidId/download', requireAuth, async (req, res) => {
     const { bidId }        = req.params;
     const { userId, role } = req.user;
@@ -600,14 +651,10 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
             `);
         const items = itemsResult.recordset;
 
-        // ── Build PDF ─────────────────────────────────────────────────────────
         const PDFDocument = require('pdfkit');
         const doc         = new PDFDocument({ margin: 50, size: 'A4' });
 
         res.setHeader('Content-Type', 'application/pdf');
-        // 'inline' (not 'attachment') so download managers like IDM don't hijack
-        // the XHR/blob fetch. The frontend forces the save with the correct
-        // filename via the anchor's `download` attribute.
         res.setHeader('Content-Disposition', `inline; filename="Bid_${bidId}_Receipt.pdf"`);
         doc.pipe(res);
 
@@ -694,8 +741,7 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
 });
 
 
-// ── 7. GET /api/bids/:bidId  — single bid with items 
-
+// ── 7. GET /api/bids/:bidId  — single bid with items
 router.get('/:bidId', requireAuth, async (req, res) => {
     const { bidId }        = req.params;
     const { userId, role } = req.user;
