@@ -2,8 +2,9 @@
 const express  = require('express');
 const router   = express.Router();
 const bcrypt   = require('bcryptjs');
-const path     = require('path');
-const fs       = require('fs-extra');
+// const path     = require('path');
+// const fs       = require('fs-extra');
+const { upload, uploadToBlob, downloadFile } = require('../utils/fileUpload');
 const { getPool, sql }      = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { upload }            = require('../utils/fileUpload');
@@ -562,10 +563,13 @@ router.get('/:supplierId/documents', requireAuth, async (req, res) => {
 router.get('/:supplierId/documents/:fileName', requireAuth, async (req, res) => {
     const { supplierId, fileName } = req.params;
     try {
-        const filePath = path.join(__dirname, '../uploads/suppliers', supplierId, fileName);
-        if (!await fs.pathExists(filePath))
-            return res.status(404).json({ message: 'File not found' });
-        res.sendFile(filePath);
+        const blobName = `${supplierId}/${fileName}`;
+        const file = await downloadFile(blobName);
+        if (!file) return res.status(404).json({ message: 'File not found' });
+
+        res.setHeader('Content-Type', file.contentType || 'application/octet-stream');
+        if (file.contentLength) res.setHeader('Content-Length', file.contentLength);
+        file.stream.pipe(res);
     } catch (error) {
         console.error('[GET document file] Error:', error);
         res.status(500).json({ message: error.message });
@@ -593,9 +597,10 @@ router.post('/:supplierId/upload-documents',
                 if (!config) continue;
 
                 const file = fileArray[0];
+                const blobName = await uploadToBlob(supplierId, file);
                 uploadedDocs.push({
                     name:           config.name,
-                    fileName:       `${supplierId}/${file.filename}`,
+                    fileName:       blobName,
                     docType:        key,
                     status:         'Pending',
                     uploadDate:     new Date().toISOString().split('T')[0],
@@ -666,7 +671,7 @@ router.post('/:supplierId/upload-experiences',
                 if (company) {
                     experiences.push({
                         company,
-                        proofFile:  file ? `${supplierId}/${file.filename}` : null,
+                        proofFile:  blobName = file ? await uploadToBlob(supplierId, file) : null,
                         uploadDate: new Date().toISOString().split('T')[0],
                         status:     'Pending'
                     });
@@ -852,15 +857,16 @@ router.post('/:supplierId/documents/:docType/renew', requireAuth, upload.single(
         let documents     = result.recordset[0].Documents ? JSON.parse(result.recordset[0].Documents) : [];
         const companyName = result.recordset[0].CompanyName;
 
+        const blobName = await uploadToBlob(supplierId, file);
         documents = documents.map(doc =>
             (doc.docType === docType && doc.status !== 'Replaced')
-                ? { ...doc, status: 'Replaced', replacedAt: new Date().toISOString(), replacedBy: file.filename }
+                ? { ...doc, status: 'Replaced', replacedAt: new Date().toISOString(), replacedBy: blobName }
                 : doc
         );
 
         const newDocument = {
             name:           config.name,
-            fileName:       `${supplierId}/${file.filename}`,
+            fileName:       blobName,
             docType,
             status:         'Pending',
             uploadDate:     new Date().toISOString().split('T')[0],
