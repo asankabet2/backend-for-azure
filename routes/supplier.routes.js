@@ -4,8 +4,6 @@ const router   = express.Router();
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
-const { getClientIp } = require('./auth.routes');
-
 const { upload, uploadToBlob, downloadFile } = require('../utils/fileUpload');
 const { getPool, sql }      = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
@@ -21,7 +19,6 @@ const PORT = process.env.PORT || 5001;
 const registerLimiter = rateLimit({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 5,
-    keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
     message: { message: 'Too many registration attempts. Please try again later.' }
 });
 
@@ -904,11 +901,15 @@ router.patch('/:supplierId/documents/:docType/verify', requireAdmin, async (req,
     }
 });
 
-// ── POST /:supplierId/documents/:docType/renew — supplier uploads new version of an existing document (e.g. after expiry)
+// ── POST /:supplierId/documents/:docType/renew — supplier uploads new version of an existing document (e.g. after expiry, rejection, or for renewal)
 router.post('/:supplierId/documents/:docType/renew', requireAuth, upload.single('document'), async (req, res) => {
     const { supplierId, docType } = req.params;
     const { expiryDate }          = req.body;
     const file = req.file;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only renew your own documents' });
+
 
     if (!file) return res.status(400).json({ message: 'No file uploaded' });
     const config = DOCUMENT_CONFIG[docType];

@@ -11,6 +11,7 @@ const { getPool, sql } = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { generateId } = require('../utils/idGenerator');
 const { logAudit } = require('../helpers/audit');
+const { sendTemplatedEmail } = require('../helpers/mailers');
 
 function getClientIp(req) {
     const ip = req.ip || req.socket.remoteAddress || '';
@@ -292,6 +293,18 @@ router.post('/forgot-password', async (req, res) => {
             .input('token', sql.NVarChar(255), resetToken)
             .input('expiry', sql.DateTime, resetExpiry)
             .query(`UPDATE SystemUser SET PasswordResetToken = @token, PasswordResetExpiry = @expiry WHERE Email = @email`);
+
+        const userRole  = result.recordset[0].Role;
+        const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}&role=${userRole}`;
+
+        try {
+            await sendTemplatedEmail(pool, sql, 'ETT007', email, {
+                resetLink,
+                orgName: process.env.ORG_NAME || 'Procurement Portal',
+            });
+        } catch (mailErr) {
+            console.error('[mailer] Failed to send password reset email:', mailErr.message);
+        }
 
         res.json({
             message: 'If an account exists for that email, a reset link has been sent',
