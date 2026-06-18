@@ -2,6 +2,7 @@
 
 const express    = require('express');
 const router     = express.Router();
+const PDFDocument = require('pdfkit');
 
 const { requireAuth, requireAdmin }   = require('../middleware/auth');
 const { getPool, sql }                = require('../db/procurement');
@@ -279,6 +280,33 @@ router.post('/', requireAuth, async (req, res) => {
         if (complianceCheck.recordset.length > 0)
             return res.status(403).json({ message: 'You have expired documents. Please renew them before submitting a bid.' });
 
+        const rejectedDocCheck = await pool.request()
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`
+                SELECT d.[value] AS doc
+                FROM SupplierProfile sp
+                CROSS APPLY OPENJSON(sp.Documents) d
+                WHERE sp.SupplierID = @supplierId
+                  AND JSON_VALUE(d.[value], '$.status') = 'Rejected'
+            `);
+
+        if (rejectedDocCheck.recordset.length > 0)
+            return res.status(403).json({ message: 'You have rejected documents. Please re-upload them before submitting a bid.' });
+
+        const pendingDocCheck = await pool.request()
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`
+                SELECT d.[value] AS doc
+                FROM SupplierProfile sp
+                CROSS APPLY OPENJSON(sp.Documents) d
+                WHERE sp.SupplierID = @supplierId
+                  AND JSON_VALUE(d.[value], '$.status') = 'Pending'
+            `);
+
+        if (pendingDocCheck.recordset.length > 0)
+            return res.status(403).json({ message: 'You have documents pending verification. Please wait for admin approval before submitting a bid.' });
+        
+
         if (!items || items.length === 0)
             return res.status(400).json({ message: 'At least one item is required' });
 
@@ -539,6 +567,36 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
                     `);
 
                 await transaction.commit();
+
+                // Notify auto-rejected suppliers
+                try {
+                    const losingBidsResult = await pool.request()
+                        .input('tenderId',   sql.VarChar(50), bid.TenderID)
+                        .input('winningBid', sql.VarChar(50), id)
+                        .query(`
+                            SELECT b.SupplierID
+                            FROM Bid b
+                            WHERE b.TenderID   = @tenderId
+                            AND b.BidID     <> @winningBid
+                            AND b.BidStatusID = 'BS003'
+                            AND b.RejectionReason = 'Tender awarded to another supplier'
+                        `);
+
+                    for (const losingBid of losingBidsResult.recordset) {
+                        const losingUserId = await getSupplierUserId(pool, losingBid.SupplierID);
+                        if (losingUserId) {
+                            await createNotification(pool, {
+                                userId:   losingUserId,
+                                userType: 'supplier',
+                                message:  `Your bid for "${bid.tenderTitle}" was not successful. The tender has been awarded to another supplier.`,
+                                type:     'error',
+                                link:     '/supplier/bids',
+                            });
+                        }
+                    }
+                } catch (notifErr) {
+                    console.error('[notify] Failed to notify auto-rejected suppliers:', notifErr.message);
+                }
             } catch (err) {
                 await transaction.rollback();
                 throw err;
@@ -564,8 +622,9 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
         const supplierUserId = await getSupplierUserId(pool, bid.SupplierID);
         if (supplierUserId) {
             await createNotification(pool, {
-                userId:  supplierUserId,
-                message: status === 'Awarded'
+                userId:   supplierUserId,
+                userType: 'supplier',
+                message:  status === 'Awarded'
                     ? `Congratulations! Your bid for "${bid.tenderTitle}" has been awarded.`
                     : `Your bid for "${bid.tenderTitle}" was not successful.${note ? ` Reason: ${note}` : ''}`,
                 type:    status === 'Awarded' ? 'success' : 'error',
@@ -651,7 +710,7 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
             `);
         const items = itemsResult.recordset;
 
-        const PDFDocument = require('pdfkit');
+        
         const doc         = new PDFDocument({ margin: 50, size: 'A4' });
 
         res.setHeader('Content-Type', 'application/pdf');
