@@ -2,7 +2,10 @@
 const express  = require('express');
 const router   = express.Router();
 const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const { getClientIp } = require('./auth.routes');
+
 const { upload, uploadToBlob, downloadFile } = require('../utils/fileUpload');
 const { getPool, sql }      = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
@@ -21,6 +24,35 @@ const registerLimiter = rateLimit({
     keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
     message: { message: 'Too many registration attempts. Please try again later.' }
 });
+
+function verifySupplierUploadAccess(req, res, next) {
+    const authHeader = req.headers.authorization;
+    const token       = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+    const { supplierId } = req.params;
+
+    if (!token) return res.status(401).json({ message: 'Authentication required' });
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        // Scoped token issued at registration — only valid for this one supplierId
+        if (decoded.purpose === 'document-upload') {
+            if (decoded.supplierId !== supplierId)
+                return res.status(403).json({ message: 'Token does not match this supplier' });
+            return next();
+        }
+
+        // Full login session (supplier uploading to own profile, or admin)
+        if (decoded.role === 'admin' || decoded.userId === supplierId) {
+            req.user = decoded;
+            return next();
+        }
+
+        return res.status(403).json({ message: 'Forbidden: You can only upload to your own profile' });
+    } catch (err) {
+        return res.status(401).json({ message: 'Invalid or expired token' });
+    }
+}
 
 // ── GET /api/suppliers/generate-registration-number  (public) 
 router.get('/generate-registration-number', async (req, res) => {
@@ -148,11 +180,18 @@ router.post('/register', registerLimiter, async (req, res) => {
                 actor: { userId: supplierId, role: 'supplier', email },
             });
 
+            const uploadToken = jwt.sign(
+                { supplierId, purpose: 'document-upload' },
+                process.env.JWT_SECRET,
+                { expiresIn: '30m' }
+            );
+
             res.status(201).json({
                 message: 'Registration successful! Please wait for admin approval.',
                 supplierId,
-                registrationNumber
-            });
+                registrationNumber,
+                uploadToken
+            });    
         } catch (error) {
             await transaction.rollback();
             throw error;
@@ -453,6 +492,11 @@ router.patch('/:id/status', requireAdmin, async (req, res) => {
 // ── GET /api/suppliers/:supplierId/interests 
 router.get('/:supplierId/interests', requireAuth, async (req, res) => {
     const { supplierId } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
+
     try {
         const pool   = await getPool();
         const result = await pool.request()
@@ -474,6 +518,11 @@ router.get('/:supplierId/interests', requireAuth, async (req, res) => {
 // ── GET /api/suppliers/:supplierId/experiences 
 router.get('/:supplierId/experiences', requireAuth, async (req, res) => {
     const { supplierId } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
+
     try {
         const pool   = await getPool();
         const result = await pool.request()
@@ -501,6 +550,10 @@ router.get('/:supplierId/experiences', requireAuth, async (req, res) => {
 // ── GET /api/suppliers/:supplierId/experience-documents 
 router.get('/:supplierId/experience-documents', requireAuth, async (req, res) => {
     const { supplierId } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
     try {
         const pool   = await getPool();
         const result = await pool.request()
@@ -533,6 +586,10 @@ router.get('/:supplierId/experience-documents', requireAuth, async (req, res) =>
 // ── GET /api/suppliers/:supplierId/documents 
 router.get('/:supplierId/documents', requireAuth, async (req, res) => {
     const { supplierId } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
     try {
         const pool   = await getPool();
         const result = await pool.request()
@@ -553,7 +610,7 @@ router.get('/:supplierId/documents', requireAuth, async (req, res) => {
                 downloadUrl: fileName
                     ? `${baseUrl}/api/suppliers/${supplierId}/documents/${fileName}`
                     : null,
-                canRenew: doc.requiresExpiry && ['expired', 'critical', 'warning'].includes(doc.status)
+                canRenew: doc.status === 'Rejected'
             };
         });
 
@@ -567,6 +624,11 @@ router.get('/:supplierId/documents', requireAuth, async (req, res) => {
 // ── GET /api/suppliers/:supplierId/documents/:fileName  — serve file 
 router.get('/:supplierId/documents/:fileName', requireAuth, async (req, res) => {
     const { supplierId, fileName } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
+
     try {
         const blobName = `${supplierId}/${fileName}`;
         const file = await downloadFile(blobName);
@@ -583,6 +645,7 @@ router.get('/:supplierId/documents/:fileName', requireAuth, async (req, res) => 
 
 // ── POST /api/suppliers/:supplierId/upload-documents 
 router.post('/:supplierId/upload-documents',
+    verifySupplierUploadAccess,
     upload.fields(Object.keys(DOCUMENT_CONFIG).map(name => ({ name, maxCount: 1 }))),
     async (req, res) => {
         const supplierId = req.params.supplierId;
@@ -654,6 +717,7 @@ router.post('/:supplierId/upload-documents',
 
 // ── POST /api/suppliers/:supplierId/upload-experiences 
 router.post('/:supplierId/upload-experiences',
+    verifySupplierUploadAccess,
     upload.fields(Array.from({ length: 10 }, (_, i) => ({ name: `experienceProof${i}`, maxCount: 1 }))),
     async (req, res) => {
         const { supplierId } = req.params;
@@ -676,7 +740,7 @@ router.post('/:supplierId/upload-experiences',
                 if (company) {
                     experiences.push({
                         company,
-                        proofFile:  blobName = file ? await uploadToBlob(supplierId, file) : null,
+                        proofFile:   file ? await uploadToBlob(supplierId, file) : null,
                         uploadDate: new Date().toISOString().split('T')[0],
                         status:     'Pending'
                     });
@@ -849,6 +913,19 @@ router.post('/:supplierId/documents/:docType/renew', requireAuth, upload.single(
     if (!file) return res.status(400).json({ message: 'No file uploaded' });
     const config = DOCUMENT_CONFIG[docType];
     if (!config) return res.status(400).json({ message: 'Invalid document type' });
+
+    if (config.requiresExpiry) {
+        if (!expiryDate) return res.status(400).json({ message: 'Expiry date is required for this document type' });
+
+        const parsedExpiry = new Date(expiryDate);
+        if (isNaN(parsedExpiry.getTime()))
+            return res.status(400).json({ message: 'Invalid expiry date' });
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        if (parsedExpiry < today)
+            return res.status(400).json({ message: 'Expiry date cannot be in the past' });
+    }
 
     try {
         const pool   = await getPool();

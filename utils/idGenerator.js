@@ -1,10 +1,11 @@
 // utils/idGenerator.js
 const { getPool } = require('../db/procurement');
+const crypto = require('crypto');
 
 // Random unique id:  <PREFIX>-<timestamp36>-<random4>   e.g. BID-LXR3K9-A1B2
 function generateId(prefix) {
     const ts = Date.now().toString(36);
-    const rnd = Math.random().toString(36).slice(2, 6);
+    const rnd = require('crypto').randomBytes(6).toString('hex'); // 12 hex chars, CSPRNG
     return `${prefix}-${ts}-${rnd}`.toUpperCase();
 }
 
