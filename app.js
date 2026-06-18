@@ -38,6 +38,8 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', message: 'Backend running with SQL Server' });
 });
 
+app.set('trust proxy', 1);
+
 // Mount all routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tenders', tenderRoutes);

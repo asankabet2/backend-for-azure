@@ -2,12 +2,10 @@
 const express  = require('express');
 const router   = express.Router();
 const bcrypt   = require('bcryptjs');
-// const path     = require('path');
-// const fs       = require('fs-extra');
+const rateLimit = require('express-rate-limit');
 const { upload, uploadToBlob, downloadFile } = require('../utils/fileUpload');
 const { getPool, sql }      = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
-const { upload }            = require('../utils/fileUpload');
 const { generateRegistrationNumber } = require('../helpers/tenderHelpers');
 const { createNotification, getAdminUserIds, getSupplierUserId } = require('../helpers/notifications');
 const { DOCUMENT_CONFIG }   = require('../config/documents');
@@ -16,6 +14,13 @@ const { logAudit }          = require('../helpers/audit');
 const { sendTemplatedEmail } = require('../helpers/mailers');
 
 const PORT = process.env.PORT || 5001;
+
+const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5,
+    keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
+    message: { message: 'Too many registration attempts. Please try again later.' }
+});
 
 // ── GET /api/suppliers/generate-registration-number  (public) 
 router.get('/generate-registration-number', async (req, res) => {
@@ -30,7 +35,7 @@ router.get('/generate-registration-number', async (req, res) => {
 });
 
 // ── POST /api/suppliers/register  (public) 
-router.post('/register', async (req, res) => {
+router.post('/register', registerLimiter, async (req, res) => {
     const {
         companyName, tin, dateOfIncorporation, countryOfIncorporation,
         companyTypeId, contactPerson, designation, email, phone, address,

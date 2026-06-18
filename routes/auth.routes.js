@@ -5,14 +5,30 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
+const net = require('net');
 const { getPool, sql } = require('../db/procurement');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { generateId } = require('../utils/idGenerator');
 const { logAudit } = require('../helpers/audit');
 
+function getClientIp(req) {
+    const ip = req.ip || req.socket.remoteAddress || '';
+    if (net.isIP(ip)) return ip;
+
+    const ipv4WithPort = ip.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$/);
+    if (ipv4WithPort) return ipv4WithPort[1];
+
+    const ipv6WithPort = ip.match(/^\[(.+)\]:\d+$/);
+    if (ipv6WithPort) return ipv6WithPort[1];
+
+    return ip;
+}
+
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
+    keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
     message: { message: 'Too many login attempts. Please try again in 15 minutes.' }
 });
 
