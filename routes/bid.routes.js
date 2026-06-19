@@ -305,7 +305,7 @@ router.post('/', requireAuth, async (req, res) => {
 
         if (pendingDocCheck.recordset.length > 0)
             return res.status(403).json({ message: 'You have documents pending verification. Please wait for admin approval before submitting a bid.' });
-        
+
 
         if (!items || items.length === 0)
             return res.status(400).json({ message: 'At least one item is required' });
@@ -710,8 +710,7 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
             `);
         const items = itemsResult.recordset;
 
-        
-        const doc         = new PDFDocument({ margin: 50, size: 'A4' });
+        const doc = new PDFDocument({ margin: 50, size: 'A4' });
 
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="Bid_${bidId}_Receipt.pdf"`);
@@ -722,72 +721,85 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
         doc.fontSize(10).font('Helvetica').text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
         doc.moveDown(2);
 
-        doc.rect(50, doc.y, 495, 60).stroke();
-        doc.fontSize(10).font('Helvetica-Bold').text('BID REFERENCE:', 60, doc.y + 10);
-        doc.font('Helvetica').text(bid.BidID, 60, doc.y + 25);
-        doc.font('Helvetica-Bold').text('SUBMITTED DATE:', 300, doc.y + 10);
-        doc.font('Helvetica').text(new Date(bid.SubmittedDate).toLocaleString(), 300, doc.y + 25);
-        doc.font('Helvetica-Bold').text('STATUS:', 60, doc.y + 40);
+        const refBoxTop = doc.y;
+        doc.rect(50, refBoxTop, 495, 60).stroke();
+        doc.fontSize(10).font('Helvetica-Bold').text('BID REFERENCE:', 60, refBoxTop + 10);
+        doc.font('Helvetica').text(bid.BidID, 60, refBoxTop + 25);
+        doc.font('Helvetica-Bold').text('SUBMITTED DATE:', 300, refBoxTop + 10);
+        doc.font('Helvetica').text(new Date(bid.SubmittedDate).toLocaleString(), 300, refBoxTop + 25);
+        doc.font('Helvetica-Bold').text('STATUS:', 60, refBoxTop + 40);
         const statusColor = bid.Status === 'Awarded' ? 'green' : (bid.Status === 'Rejected' ? 'red' : 'orange');
-        doc.fillColor(statusColor).text(bid.Status, 120, doc.y + 40).fillColor('black');
-        doc.moveDown(3);
+        doc.fillColor(statusColor).text(bid.Status, 120, refBoxTop + 40).fillColor('black');
+        doc.y = refBoxTop + 60;
+        doc.moveDown(1);
 
+        doc.x = 50;
         doc.fontSize(14).font('Helvetica-Bold').text('TENDER DETAILS', { underline: true });
         doc.moveDown(0.5);
         doc.fontSize(10).font('Helvetica');
         const tY = doc.y;
-        doc.text('Tender ID:',    50, tY);       doc.text(bid.TenderID,   150, tY);
-        doc.text('Category:',    300, tY);       doc.text(bid.CategoryName, 380, tY);
-        doc.text('Title:',        50, tY + 20);  doc.text(bid.Title,      150, tY + 20);
-        doc.text('Closing Date:', 50, tY + 40);  doc.text(new Date(bid.ClosingDate).toLocaleDateString(), 150, tY + 40);
-        doc.text('Est. Budget:', 300, tY + 40);  doc.text(`GHS ${parseFloat(bid.EstimatedBudget).toFixed(2)}`, 430, tY + 40);
+        doc.font('Helvetica-Bold').text('Tender ID:',    50, tY);           doc.font('Helvetica').text(bid.TenderID,   150, tY);
+        doc.font('Helvetica-Bold').text('Category:',    300, tY);           doc.font('Helvetica').text(bid.CategoryName, 380, tY);
+        doc.font('Helvetica-Bold').text('Title:',        50, tY + 20);      doc.font('Helvetica').text(bid.Title,      150, tY + 20);
+        doc.font('Helvetica-Bold').text('Closing Date:', 50, tY + 40);      doc.font('Helvetica').text(new Date(bid.ClosingDate).toLocaleDateString(), 150, tY + 40);
+        doc.font('Helvetica-Bold').text('Est. Budget:', 300, tY + 40);      doc.font('Helvetica').text(`GHS ${parseFloat(bid.EstimatedBudget).toFixed(2)}`, 430, tY + 40);
         doc.moveDown(4);
 
+        doc.x = 50;
         doc.fontSize(14).font('Helvetica-Bold').text('SUPPLIER DETAILS', { underline: true });
         doc.moveDown(0.5);
         doc.fontSize(10).font('Helvetica');
         const sY = doc.y;
-        doc.text('Company Name:', 50, sY);       doc.text(bid.CompanyName,        160, sY);
-        doc.text('Reg Number:',  300, sY);       doc.text(bid.RegistrationNumber,  400, sY);
-        doc.text('Contact:',      50, sY + 20);  doc.text(bid.ContactPerson,       160, sY + 20);
-        doc.text('Email:',       300, sY + 20);  doc.text(bid.Email,               350, sY + 20);
-        doc.text('Phone:',        50, sY + 40);  doc.text(bid.Phone   || '—',      100, sY + 40);
-        doc.text('Address:',     300, sY + 40);  doc.text(bid.Address || '—',      360, sY + 40);
+        doc.font('Helvetica-Bold').text('Company Name:', 50, sY);       doc.font('Helvetica').text(bid.CompanyName,        160, sY);
+        doc.font('Helvetica-Bold').text('Reg Number:',  300, sY);       doc.font('Helvetica').text(bid.RegistrationNumber,  400, sY);
+        doc.font('Helvetica-Bold').text('Contact:',      50, sY + 20);  doc.font('Helvetica').text(bid.ContactPerson,       160, sY + 20);
+        doc.font('Helvetica-Bold').text('Email:',       300, sY + 20);  doc.font('Helvetica').text(bid.Email,               350, sY + 20);
+        doc.font('Helvetica-Bold').text('Phone:',        50, sY + 40);  doc.font('Helvetica').text(bid.Phone   || '—',      100, sY + 40);
+        doc.font('Helvetica-Bold').text('Address:',     300, sY + 40);  doc.font('Helvetica').text(bid.Address || '—',      360, sY + 40);
         doc.moveDown(4);
 
+        doc.x = 50;
         doc.fontSize(14).font('Helvetica-Bold').text('BID ITEMS', { underline: true });
         doc.moveDown(0.5);
-        const cols     = [50, 130, 220, 280, 330, 380, 450];
-        const tableTop = doc.y;
+        const cols      = [50, 95, 280, 335, 385, 460];
+        const colWidths  = [40, 180, 50, 45, 70, 85];
+        const tableTop   = doc.y;
         doc.fontSize(9).font('Helvetica-Bold');
-        doc.text('Item #',      cols[0], tableTop);
-        doc.text('Item Code',   cols[1], tableTop);
-        doc.text('Description', cols[2], tableTop);
-        doc.text('Unit',        cols[3], tableTop);
-        doc.text('Quantity',    cols[4], tableTop, { width: 50, align: 'right' });
-        doc.text('Unit Price',  cols[5], tableTop, { width: 60, align: 'right' });
-        doc.text('Total',       cols[6], tableTop, { width: 60, align: 'right' });
+        doc.text('Item #',      cols[0], tableTop, { width: colWidths[0] });
+        doc.text('Description', cols[1], tableTop, { width: colWidths[1] });
+        doc.text('Unit',        cols[2], tableTop, { width: colWidths[2] });
+        doc.text('Quantity',    cols[3], tableTop, { width: colWidths[3], align: 'right' });
+        doc.text('Unit Price',  cols[4], tableTop, { width: colWidths[4], align: 'right' });
+        doc.text('Total',       cols[5], tableTop, { width: colWidths[5], align: 'right' });
         doc.moveTo(50, tableTop + 15).lineTo(545, tableTop + 15).stroke();
 
         let curY = tableTop + 25;
         doc.fontSize(9).font('Helvetica');
         items.forEach(item => {
-            if (curY > 700) { doc.addPage(); curY = 50; }
-            doc.text(item.ItemNo.toString(),                         cols[0], curY);
-            doc.text(item.TenderItemID,                              cols[1], curY, { width: 80 });
-            doc.text(item.Description.substring(0, 40),              cols[2], curY, { width: 100 });
-            doc.text(item.Unit,                                      cols[3], curY);
-            doc.text(item.Quantity.toString(),                       cols[4], curY, { width: 50, align: 'right' });
-            doc.text(`GHS ${parseFloat(item.UnitPrice).toFixed(2)}`, cols[5], curY, { width: 60, align: 'right' });
-            doc.text(`GHS ${parseFloat(item.Total).toFixed(2)}`,     cols[6], curY, { width: 60, align: 'right' });
-            curY += 20;
+            const description = item.Description || '';
+            const descHeight  = doc.heightOfString(description, { width: colWidths[1] });
+            const rowHeight   = Math.max(20, descHeight + 6);
+
+            if (curY + rowHeight > 720) {
+                doc.addPage();
+                curY = 50;
+            }
+
+            doc.text(item.ItemNo.toString(),                         cols[0], curY, { width: colWidths[0] });
+            doc.text(description,                                    cols[1], curY, { width: colWidths[1] });
+            doc.text(item.Unit,                                      cols[2], curY, { width: colWidths[2] });
+            doc.text(item.Quantity.toString(),                       cols[3], curY, { width: colWidths[3], align: 'right' });
+            doc.text(`GHS ${parseFloat(item.UnitPrice).toFixed(2)}`, cols[4], curY, { width: colWidths[4], align: 'right' });
+            doc.text(`GHS ${parseFloat(item.Total).toFixed(2)}`,     cols[5], curY, { width: colWidths[5], align: 'right' });
+
+            curY += rowHeight;
         });
 
         curY += 10;
         doc.moveTo(350, curY - 5).lineTo(545, curY - 5).stroke();
         doc.fontSize(12).font('Helvetica-Bold');
         doc.text('GRAND TOTAL:', 350, curY);
-        doc.text(`GHS ${parseFloat(bid.GrandTotal).toFixed(2)}`, 450, curY, { align: 'right' });
+        doc.text(`GHS ${parseFloat(bid.GrandTotal).toFixed(2)}`, 450, curY, { width: 95, align: 'right' });
         doc.fontSize(8).font('Helvetica')
             .text('This is a system-generated receipt. Please retain for your records.', 50, 750, { align: 'center' });
 
