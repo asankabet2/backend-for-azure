@@ -6,6 +6,7 @@ const cors = require('cors');
 const path = require('path');
 
 // Import route modules
+const syncRoutes = require('./routes/sync.routes');
 const authRoutes = require('./routes/auth.routes');
 const tenderRoutes = require('./routes/tender.routes');
 const bidRoutes = require('./routes/bid.routes');
@@ -41,6 +42,7 @@ app.get('/api/health', (req, res) => {
 app.set('trust proxy', 1);
 
 // Mount all routes
+app.use('/api/sync', syncRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/tenders', tenderRoutes);
 app.use('/api/tenders', evaluationRoutes);   // /:tenderId/criteria, evaluation flow

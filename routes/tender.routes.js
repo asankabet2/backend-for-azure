@@ -99,174 +99,174 @@ router.get('/:id', async (req, res) => {
 
 
 // ── Status mapping: Admin DB → Supplier DB
-function mapAdminStatusToSupplier(adminStatusId) {
-    const statusMap = {
-        'D002': 'TS001',
-        'D003': 'TS002',
-        'D004': 'TS003',
-        'D005': 'TS004',
-    };
-    return statusMap[adminStatusId] || 'TS001';
-}
+// function mapAdminStatusToSupplier(adminStatusId) {
+//     const statusMap = {
+//         'D002': 'TS001',
+//         'D003': 'TS002',
+//         'D004': 'TS003',
+//         'D005': 'TS004',
+//     };
+//     return statusMap[adminStatusId] || 'TS001';
+// }
 
-// // ── POST /api/tenders  — admin only 
-// router.post('/', requireAdmin, async (req, res) => {
-//     const { title, categoryId, description, status, openingDate, closingDate, estimatedBudget, items, requiredDocuments } = req.body;
+// ── POST /api/tenders  — admin only 
+router.post('/', requireAdmin, async (req, res) => {
+    const { title, categoryId, description, status, openingDate, closingDate, estimatedBudget, items, requiredDocuments } = req.body;
 
-//     // validate required fields before touching the DB
-//     if (!title || !title.trim())
-//         return res.status(400).json({ message: 'title is required' });
-//     if (!closingDate)
-//         return res.status(400).json({ message: 'closingDate is required' });
-//     if (!categoryId)
-//         return res.status(400).json({ message: 'categoryId is required' });
+    // validate required fields before touching the DB
+    if (!title || !title.trim())
+        return res.status(400).json({ message: 'title is required' });
+    if (!closingDate)
+        return res.status(400).json({ message: 'closingDate is required' });
+    if (!categoryId)
+        return res.status(400).json({ message: 'categoryId is required' });
 
-//     const tenderStatusId = mapTenderStatus(status);
-//     const tenderId       = generateId('T');
-
-//     try {
-//         const pool = await getPool();
-
-//         await pool.request()
-//             .input('tenderId',        sql.VarChar(50),       tenderId)
-//             .input('title',           sql.NVarChar(255),     title)
-//             .input('categoryId',      sql.VarChar(20),       categoryId)
-//             .input('description',     sql.NVarChar(sql.MAX), description || '')
-//             .input('statusId',        sql.VarChar(20),       tenderStatusId)
-//             .input('publishedDate',   sql.Date,              new Date().toISOString().split('T')[0])
-//             .input('openingDate',     sql.Date,              openingDate   || null)
-//             .input('closingDate',     sql.Date,              closingDate)
-//             .input('estimatedBudget', sql.Decimal(18, 2),    estimatedBudget || 0)
-//             .input('requiredDocuments', sql.NVarChar(sql.MAX),
-//                 Array.isArray(requiredDocuments) ? JSON.stringify(requiredDocuments) : null)
-//             .query(`
-//                 INSERT INTO Tender (
-//                     TenderID, Title, CategoryID, Description, TenderStatusID,
-//                     PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
-//                     RequiredDocuments, CreatedAt, UpdatedAt
-//                 ) VALUES (
-//                     @tenderId, @title, @categoryId, @description, @statusId,
-//                     @publishedDate, @openingDate, @closingDate, @estimatedBudget,
-//                     @requiredDocuments, GETDATE(), GETDATE()
-//                 )
-//             `);
-
-//         if (items && items.length > 0) {
-//             for (const item of items) {
-//                 await pool.request()
-//                     .input('tenderItemId',       sql.VarChar(50),       generateId('TI'))
-//                     .input('tenderId',           sql.VarChar(50),       tenderId)
-//                     .input('itemNo',             sql.Int,               item.itemNo)
-//                     .input('description',        sql.NVarChar(sql.MAX), item.description        || '')
-//                     .input('unit',               sql.NVarChar(50),      item.unit               || '')
-//                     .input('quantity',           sql.Decimal(18, 2),    item.quantity           || 0)
-//                     .input('estimatedUnitPrice', sql.Decimal(18, 2),    item.estimatedUnitPrice || 0)
-//                     .query(`
-//                         INSERT INTO TenderItem
-//                             (TenderItemID, TenderID, ItemNo, Description, Unit, Quantity, EstimatedUnitPrice, CreatedAt)
-//                         VALUES
-//                             (@tenderItemId, @tenderId, @itemNo, @description, @unit, @quantity, @estimatedUnitPrice, GETDATE())
-//                     `);
-//             }
-//         }
-
-//         // Notify approved suppliers in this category when published as Open
-//         if (status === 'Open') {
-//             const interestedSuppliers = await pool.request()
-//                 .input('categoryId', sql.VarChar(20), categoryId)
-//                 .query(`
-//                     SELECT DISTINCT su.UserID
-//                     FROM SupplierCategories sc
-//                     JOIN SystemUser      su ON sc.SupplierID      = su.SupplierID
-//                     JOIN SupplierProfile sp ON sc.SupplierID      = sp.SupplierID
-//                     JOIN ProfileStatus   ps ON sp.ProfileStatusID = ps.ProfileStatusID
-//                     WHERE sc.CategoryID = @categoryId
-//                       AND su.Role = 'supplier'
-//                       AND ps.ProfileStatusName = 'Approved'
-//                 `);
-
-//             for (const row of interestedSuppliers.recordset) {
-//                 await createNotification(pool, {
-//                     userId:  row.UserID,
-//                     message: `A new tender "${title}" has been published in your category.`,
-//                     type:    'info',
-//                     link:    `/supplier/tenders/${tenderId}`,
-//                 });
-//             }
-//         }
-
-//         await logAudit(pool, req, {
-//             action: 'TENDER_CREATE', entityType: 'Tender', entityId: tenderId,
-//             description: `Created tender "${title}" (status: ${status || 'Draft'})`,
-//         });
-
-//         res.status(201).json({
-//             message: 'Tender created successfully',
-//             tender:  { id: tenderId, title, categoryId, status, closingDate },
-//         });
-//     } catch (error) {
-//         console.error('[POST /api/tenders] Error:', error);
-//         res.status(500).json({ message: error.message });
-//     }
-// });
-
-// ── POST /api/tenders/sync — called by ASP scheduler only
-router.post('/sync', async (req, res) => {
-    const apiKey = req.headers['x-sync-api-key'];
-    if (!apiKey || apiKey !== process.env.SYNC_API_KEY)
-        return res.status(401).json({ message: 'Unauthorized' });
-
-    const {
-        drugtenderid, drugtendername, drugtendercatid, drugtenderstatusid,
-        tenderstartdate, tenderenddate, tenderinfo1, tenderdate1, tendervalue1,
-    } = req.body;
-
-    const tenderStatusId = mapAdminStatusToSupplier(drugtenderstatusid);
+    const tenderStatusId = mapTenderStatus(status);
+    const tenderId       = generateId('T');
 
     try {
         const pool = await getPool();
 
         await pool.request()
-            .input('tenderId',        sql.VarChar(50),       drugtenderid)
-            .input('title',           sql.NVarChar(255),     drugtendername)
-            .input('categoryId',      sql.VarChar(20),       drugtendercatid)
-            .input('description',     sql.NVarChar(sql.MAX), tenderinfo1 || '')
+            .input('tenderId',        sql.VarChar(50),       tenderId)
+            .input('title',           sql.NVarChar(255),     title)
+            .input('categoryId',      sql.VarChar(20),       categoryId)
+            .input('description',     sql.NVarChar(sql.MAX), description || '')
             .input('statusId',        sql.VarChar(20),       tenderStatusId)
-            .input('publishedDate',   sql.Date,              tenderdate1 || null)
-            .input('openingDate',     sql.Date,              tenderstartdate || null)
-            .input('closingDate',     sql.Date,              tenderenddate || null)
-            .input('estimatedBudget', sql.Decimal(18, 2),    tendervalue1 || 0)
+            .input('publishedDate',   sql.Date,              new Date().toISOString().split('T')[0])
+            .input('openingDate',     sql.Date,              openingDate   || null)
+            .input('closingDate',     sql.Date,              closingDate)
+            .input('estimatedBudget', sql.Decimal(18, 2),    estimatedBudget || 0)
+            .input('requiredDocuments', sql.NVarChar(sql.MAX),
+                Array.isArray(requiredDocuments) ? JSON.stringify(requiredDocuments) : null)
             .query(`
-                IF EXISTS (SELECT 1 FROM Tender WHERE TenderID = @tenderId)
-                    UPDATE Tender SET
-                        Title           = @title,
-                        CategoryID      = @categoryId,
-                        Description     = @description,
-                        TenderStatusID  = @statusId,
-                        PublishedDate   = @publishedDate,
-                        OpeningDate     = @openingDate,
-                        ClosingDate     = @closingDate,
-                        EstimatedBudget = @estimatedBudget,
-                        UpdatedAt       = GETDATE()
-                    WHERE TenderID = @tenderId
-                ELSE
-                    INSERT INTO Tender (
-                        TenderID, Title, CategoryID, Description, TenderStatusID,
-                        PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
-                        CreatedAt, UpdatedAt
-                    ) VALUES (
-                        @tenderId, @title, @categoryId, @description, @statusId,
-                        @publishedDate, @openingDate, @closingDate, @estimatedBudget,
-                        GETDATE(), GETDATE()
-                    )
+                INSERT INTO Tender (
+                    TenderID, Title, CategoryID, Description, TenderStatusID,
+                    PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
+                    RequiredDocuments, CreatedAt, UpdatedAt
+                ) VALUES (
+                    @tenderId, @title, @categoryId, @description, @statusId,
+                    @publishedDate, @openingDate, @closingDate, @estimatedBudget,
+                    @requiredDocuments, GETDATE(), GETDATE()
+                )
             `);
 
-        res.json({ success: true });
-    } catch (err) {
-        console.error('[POST /api/tenders/sync] Error:', err);
-        res.status(500).json({ message: err.message });
+        if (items && items.length > 0) {
+            for (const item of items) {
+                await pool.request()
+                    .input('tenderItemId',       sql.VarChar(50),       generateId('TI'))
+                    .input('tenderId',           sql.VarChar(50),       tenderId)
+                    .input('itemNo',             sql.Int,               item.itemNo)
+                    .input('description',        sql.NVarChar(sql.MAX), item.description        || '')
+                    .input('unit',               sql.NVarChar(50),      item.unit               || '')
+                    .input('quantity',           sql.Decimal(18, 2),    item.quantity           || 0)
+                    .input('estimatedUnitPrice', sql.Decimal(18, 2),    item.estimatedUnitPrice || 0)
+                    .query(`
+                        INSERT INTO TenderItem
+                            (TenderItemID, TenderID, ItemNo, Description, Unit, Quantity, EstimatedUnitPrice, CreatedAt)
+                        VALUES
+                            (@tenderItemId, @tenderId, @itemNo, @description, @unit, @quantity, @estimatedUnitPrice, GETDATE())
+                    `);
+            }
+        }
+
+        // Notify approved suppliers in this category when published as Open
+        if (status === 'Open') {
+            const interestedSuppliers = await pool.request()
+                .input('categoryId', sql.VarChar(20), categoryId)
+                .query(`
+                    SELECT DISTINCT su.UserID
+                    FROM SupplierCategories sc
+                    JOIN SystemUser      su ON sc.SupplierID      = su.SupplierID
+                    JOIN SupplierProfile sp ON sc.SupplierID      = sp.SupplierID
+                    JOIN ProfileStatus   ps ON sp.ProfileStatusID = ps.ProfileStatusID
+                    WHERE sc.CategoryID = @categoryId
+                      AND su.Role = 'supplier'
+                      AND ps.ProfileStatusName = 'Approved'
+                `);
+
+            for (const row of interestedSuppliers.recordset) {
+                await createNotification(pool, {
+                    userId:  row.UserID,
+                    message: `A new tender "${title}" has been published in your category.`,
+                    type:    'info',
+                    link:    `/supplier/tenders/${tenderId}`,
+                });
+            }
+        }
+
+        await logAudit(pool, req, {
+            action: 'TENDER_CREATE', entityType: 'Tender', entityId: tenderId,
+            description: `Created tender "${title}" (status: ${status || 'Draft'})`,
+        });
+
+        res.status(201).json({
+            message: 'Tender created successfully',
+            tender:  { id: tenderId, title, categoryId, status, closingDate },
+        });
+    } catch (error) {
+        console.error('[POST /api/tenders] Error:', error);
+        res.status(500).json({ message: error.message });
     }
 });
+
+// ── POST /api/tenders/sync — called by ASP scheduler only
+// router.post('/sync', async (req, res) => {
+//     const apiKey = req.headers['x-sync-api-key'];
+//     if (!apiKey || apiKey !== process.env.SYNC_API_KEY)
+//         return res.status(401).json({ message: 'Unauthorized' });
+
+//     const {
+//         drugtenderid, drugtendername, drugtendercatid, drugtenderstatusid,
+//         tenderstartdate, tenderenddate, tenderinfo1, tenderdate1, tendervalue1,
+//     } = req.body;
+
+//     const tenderStatusId = mapAdminStatusToSupplier(drugtenderstatusid);
+
+//     try {
+//         const pool = await getPool();
+
+//         await pool.request()
+//             .input('tenderId',        sql.VarChar(50),       drugtenderid)
+//             .input('title',           sql.NVarChar(255),     drugtendername)
+//             .input('categoryId',      sql.VarChar(20),       drugtendercatid)
+//             .input('description',     sql.NVarChar(sql.MAX), tenderinfo1 || '')
+//             .input('statusId',        sql.VarChar(20),       tenderStatusId)
+//             .input('publishedDate',   sql.Date,              tenderdate1 || null)
+//             .input('openingDate',     sql.Date,              tenderstartdate || null)
+//             .input('closingDate',     sql.Date,              tenderenddate || null)
+//             .input('estimatedBudget', sql.Decimal(18, 2),    tendervalue1 || 0)
+//             .query(`
+//                 IF EXISTS (SELECT 1 FROM Tender WHERE TenderID = @tenderId)
+//                     UPDATE Tender SET
+//                         Title           = @title,
+//                         CategoryID      = @categoryId,
+//                         Description     = @description,
+//                         TenderStatusID  = @statusId,
+//                         PublishedDate   = @publishedDate,
+//                         OpeningDate     = @openingDate,
+//                         ClosingDate     = @closingDate,
+//                         EstimatedBudget = @estimatedBudget,
+//                         UpdatedAt       = GETDATE()
+//                     WHERE TenderID = @tenderId
+//                 ELSE
+//                     INSERT INTO Tender (
+//                         TenderID, Title, CategoryID, Description, TenderStatusID,
+//                         PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
+//                         CreatedAt, UpdatedAt
+//                     ) VALUES (
+//                         @tenderId, @title, @categoryId, @description, @statusId,
+//                         @publishedDate, @openingDate, @closingDate, @estimatedBudget,
+//                         GETDATE(), GETDATE()
+//                     )
+//             `);
+
+//         res.json({ success: true });
+//     } catch (err) {
+//         console.error('[POST /api/tenders/sync] Error:', err);
+//         res.status(500).json({ message: err.message });
+//     }
+// });
 
 
 // ── PUT /api/tenders/:id  — admin only
