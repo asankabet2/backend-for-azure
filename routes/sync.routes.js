@@ -30,24 +30,10 @@ router.get('/suppliers', async (req, res) => {
         
         let query = `
             SELECT 
-                sp.SupplierID,
-                sp.RegistrationNumber,
-                sp.CompanyName,
-                sp.TIN,
-                sp.ContactPerson,
-                sp.Designation,
-                sp.Email,
-                sp.Phone,
-                sp.Address,
-                sp.CityID,
-                sp.RegionID,
-                sp.CountryID,
-                sp.ProfileStatusID,
-                sp.RejectionReason,
-                sp.DateApplied,
-                sp.CreatedAt,
-                sp.UpdateDate,
-                c.CityName
+                sp.SupplierID, sp.RegistrationNumber, sp.CompanyName, sp.TIN,
+                sp.ContactPerson, sp.Designation, sp.Email, sp.Phone, sp.Address,
+                sp.CityID, sp.RegionID, sp.CountryID, sp.ProfileStatusID, sp.RejectionReason,
+                sp.DateApplied, sp.CreatedAt, sp.UpdateDate, c.CityName
             FROM SupplierProfile sp
             LEFT JOIN Cities c ON sp.CityID = c.CityID
             WHERE sp.ProfileStatusID = 'PS002'
