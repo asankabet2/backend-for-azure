@@ -9,21 +9,23 @@ function mapTenderStatus(status) {
 async function generateRegistrationNumber(pool) {
     const now = new Date();
     const yearMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const prefix = `Reg${yearMonth}`;
 
     const result = await pool.request()
-        .input('pattern', sql.VarChar(50), `Reg${yearMonth}%`)
+        .input('prefix', sql.VarChar(20), prefix)
         .query(`
-            SELECT TOP 1 RegistrationNumber FROM SupplierProfile
-            WHERE RegistrationNumber LIKE @pattern
-            ORDER BY RegistrationNumber DESC
+            MERGE RegistrationCounters WITH (HOLDLOCK) AS target
+            USING (VALUES (@prefix)) AS source (Prefix)
+            ON target.Prefix = source.Prefix
+            WHEN MATCHED THEN
+                UPDATE SET LastSeq = target.LastSeq + 1
+            WHEN NOT MATCHED THEN
+                INSERT (Prefix, LastSeq) VALUES (@prefix, 1)
+            OUTPUT inserted.LastSeq;
         `);
 
-    let nextNumber = 1;
-    if (result.recordset.length > 0) {
-        const lastSeq = parseInt(result.recordset[0].RegistrationNumber.slice(-5), 10);
-        if (!isNaN(lastSeq)) nextNumber = lastSeq + 1;
-    }
-    return `Reg${yearMonth}${String(nextNumber).padStart(5, '0')}`;
+    const seq = result.recordset[0].LastSeq;
+    return `${prefix}${String(seq).padStart(5, '0')}`;
 }
 
 module.exports = { mapTenderStatus, generateRegistrationNumber };
