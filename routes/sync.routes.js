@@ -27,7 +27,7 @@ router.get('/suppliers', async (req, res) => {
 
     try {
         const pool = await getPool();
-        
+
         let query = `
             SELECT 
                 sp.SupplierID, sp.RegistrationNumber, sp.CompanyName, sp.TIN,
@@ -36,7 +36,7 @@ router.get('/suppliers', async (req, res) => {
                 sp.DateApplied, sp.CreatedAt, sp.UpdateDate, c.CityName
             FROM SupplierProfile sp
             LEFT JOIN Cities c ON sp.CityID = c.CityID
-            WHERE sp.ProfileStatusID = 'PS002'
+            WHERE sp.ProfileStatusID IN ('PS002', 'PS001')
         `;
 
         if (lastSyncDate) {
@@ -51,30 +51,43 @@ router.get('/suppliers', async (req, res) => {
         }
 
         const result = await request.query(query);
-        
-        for (let supplier of result.recordset) {
-            const catResult = await pool.request()
-                .input('supplierId', sql.VarChar(50), supplier.SupplierID)
-                .query(`
-                    SELECT CategoryID 
-                    FROM SupplierCategories 
-                    WHERE SupplierID = @supplierId
-                    ORDER BY CategoryID ASC
-                `);
-            supplier.Categories = catResult.recordset.map(c => c.CategoryID);
+
+        // Fetch all categories in one query instead of one per supplier
+        if (result.recordset.length > 0) {
+            const ids = result.recordset.map(s => `'${s.SupplierID}'`).join(',');
+            const catResult = await pool.request().query(`
+                SELECT SupplierID, CategoryID
+                FROM SupplierCategories
+                WHERE SupplierID IN (${ids})
+                ORDER BY CategoryID ASC
+            `);
+
+            const catMap = {};
+            for (const row of catResult.recordset) {
+                if (!catMap[row.SupplierID]) catMap[row.SupplierID] = [];
+                catMap[row.SupplierID].push(row.CategoryID);
+            }
+
+            for (const supplier of result.recordset) {
+                supplier.Categories = catMap[supplier.SupplierID] || [];
+            }
+        } else {
+            for (const supplier of result.recordset) {
+                supplier.Categories = [];
+            }
         }
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             suppliers: result.recordset,
             count: result.recordset.length
         });
 
     } catch (err) {
         console.error('[GET /api/sync/suppliers] Error:', err);
-        res.status(500).json({ 
-            success: false, 
-            message: err.message 
+        res.status(500).json({
+            success: false,
+            message: err.message
         });
     }
 });
@@ -135,6 +148,41 @@ router.post('/tenders', async (req, res) => {
     } catch (err) {
         console.error('[POST /api/sync/tenders] Error:', err);
         res.status(500).json({ message: err.message });
+    }
+});
+
+// ── PATCH /api/sync/suppliers/:supplierId/status ──
+router.patch('/suppliers/:supplierId/status', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { supplierId } = req.params;
+    const { status, rejectionReason } = req.body;
+
+    const allowed = ['PS001', 'PS002', 'PS003', 'PS004'];
+    if (!allowed.includes(status))
+        return res.status(400).json({ success: false, message: 'Invalid status' });
+
+    try {
+        const pool = await getPool();
+        await pool.request()
+            .input('supplierId',      sql.VarChar(50),    supplierId)
+            .input('status',          sql.VarChar(20),    status)
+            .input('rejectionReason', sql.NVarChar(500),  rejectionReason || null)
+            .query(`
+                UPDATE SupplierProfile
+                SET ProfileStatusID = @status,
+                    RejectionReason = @rejectionReason,
+                    UpdateDate       = GETDATE()
+                WHERE SupplierID = @supplierId
+            `);
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[PATCH /sync/suppliers/:id/status] Error:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
