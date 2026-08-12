@@ -64,6 +64,142 @@ router.get('/generate-registration-number', async (req, res) => {
 });
 
 // ── POST /api/suppliers/register  (public) 
+// router.post('/register', registerLimiter, async (req, res) => {
+//     const {
+//         companyName, tin, dateOfIncorporation, countryOfIncorporation,
+//         companyTypeId, contactPerson, designation, email, phone, address,
+//         cityId, regionId, countryId, categories, password
+//     } = req.body;
+
+//     try {
+//         const pool          = await getPool();
+//         const existingEmail = await pool.request()
+//             .input('email', sql.VarChar(255), email)
+//             .query(`SELECT Email FROM SystemUser WHERE Email = @email`);
+
+//         if (existingEmail.recordset.length > 0)
+//             return res.status(400).json({ message: 'Email already registered' });
+
+//         const registrationNumber = await generateRegistrationNumber(pool);
+//         const supplierId         = generateId('SUP');
+//         const userId             = generateId('USR');
+//         const hashedPassword     = await bcrypt.hash(password, 10);
+
+//         const transaction = new sql.Transaction(pool);
+//         await transaction.begin();
+
+//         try {
+//             await transaction.request()
+//                 .input('supplierId',             sql.VarChar(50),       supplierId)
+//                 .input('registrationNumber',     sql.VarChar(50),       registrationNumber)
+//                 .input('companyName',            sql.NVarChar(255),     companyName)
+//                 .input('tin',                    sql.VarChar(50),       tin || null)
+//                 .input('dateOfIncorporation',    sql.Date,              dateOfIncorporation || null)
+//                 .input('countryOfIncorporation', sql.NVarChar(100),     countryOfIncorporation || 'Ghana')
+//                 .input('companyTypeId',          sql.VarChar(20),       companyTypeId || null)
+//                 .input('contactPerson',          sql.NVarChar(255),     contactPerson)
+//                 .input('designation',            sql.NVarChar(100),     designation || null)
+//                 .input('email',                  sql.VarChar(255),      email)
+//                 .input('phone',                  sql.VarChar(50),       phone || null)
+//                 .input('address',                sql.NVarChar(sql.MAX), address || null)
+//                 .input('cityId',                 sql.VarChar(20),       cityId || null)
+//                 .input('regionId',               sql.VarChar(20),       regionId || null)
+//                 .input('countryId',              sql.VarChar(20),       countryId || null)
+//                 .input('profileStatusId',        sql.VarChar(20),       'PS001')
+//                 .input('dateApplied',            sql.Date,              new Date().toISOString().split('T')[0])
+//                 .query(`
+//                     INSERT INTO SupplierProfile (
+//                         SupplierID, RegistrationNumber, CompanyName, TIN,
+//                         DateOfIncorporation, CountryOfIncorporation, CompanyTypeID,
+//                         ContactPerson, Designation, Email, Phone, Address,
+//                         CityID, RegionID, CountryID, ProfileStatusID, DateApplied,
+//                         Documents, Experiences, CreatedAt
+//                     ) VALUES (
+//                         @supplierId, @registrationNumber, @companyName, @tin,
+//                         @dateOfIncorporation, @countryOfIncorporation, @companyTypeId,
+//                         @contactPerson, @designation, @email, @phone, @address,
+//                         @cityId, @regionId, @countryId, @profileStatusId, @dateApplied,
+//                         '[]', '[]', GETDATE()
+//                     )
+//                 `);
+
+//             await transaction.request()
+//                 .input('userId',       sql.VarChar(50),  userId)
+//                 .input('email',        sql.VarChar(255), email)
+//                 .input('passwordHash', sql.VarChar(255), hashedPassword)
+//                 .input('role',         sql.VarChar(20),  'supplier')
+//                 .input('supplierId',   sql.VarChar(50),  supplierId)
+//                 .input('userStatusId', sql.VarChar(20),  'UST001')
+//                 .query(`
+//                     INSERT INTO SystemUser
+//                         (UserID, Email, PasswordHash, Role, SupplierID, UserStatusID, IsFirstLogin, CreateDate)
+//                     VALUES
+//                         (@userId, @email, @passwordHash, @role, @supplierId, @userStatusId, 0, GETDATE())
+//                 `);
+
+//             if (categories && categories.length > 0) {
+//                 for (const categoryId of categories) {
+//                     await transaction.request()
+//                         .input('supplierId', sql.VarChar(50), supplierId)
+//                         .input('categoryId', sql.VarChar(20), categoryId)
+//                         .query(`INSERT INTO SupplierCategories (SupplierID, CategoryID) VALUES (@supplierId, @categoryId)`);
+//                 }
+//             }
+
+//             await transaction.commit();
+
+//             // Notify all admins about the new registration
+//             const adminIds = await getAdminUserIds(pool);
+//             for (const adminUserId of adminIds) {
+//                 await createNotification(pool, {
+//                     userId:   adminUserId,
+//                     userType: 'admin',
+//                     message:  `New supplier registration: ${companyName} is pending approval.`,
+//                     type:     'info',
+//                     link:     `/admin/suppliers/${supplierId}`,
+//                 });
+//             }
+
+//             // Send registration received email to the supplier
+//             try {
+//                 await sendTemplatedEmail(pool, sql, 'ETT006', email, {
+//                     supplierName: companyName,
+//                     orgName:      process.env.ORG_NAME || 'Procurement Portal',
+//                 });
+//             } catch (mailErr) {
+//                 console.error('[mailer] Failed to send registration email:', mailErr.message);
+//             }
+
+//             // Log audit record for supplier registration    
+//             await logAudit(pool, req, {
+//                 action: 'SUPPLIER_REGISTER', entityType: 'Supplier', entityId: supplierId,
+//                 description: `New supplier registration: ${companyName} (${email})`,
+//                 actor: { userId: supplierId, role: 'supplier', email },
+//             });
+
+//             const uploadToken = jwt.sign(
+//                 { supplierId, purpose: 'document-upload' },
+//                 process.env.JWT_SECRET,
+//                 { expiresIn: '30m' }
+//             );
+
+//             res.status(201).json({
+//                 message: 'Registration successful! Please wait for admin approval.',
+//                 supplierId,
+//                 registrationNumber,
+//                 uploadToken
+//             });    
+//         } catch (error) {
+//             await transaction.rollback();
+//             throw error;
+//         }
+//     } catch (error) {
+//         console.error('[POST /api/suppliers/register] Error:', error);
+//         res.status(500).json({ message: error.message });
+//     }
+// });
+
+// ── POST /api/suppliers/register  (public) 
 router.post('/register', registerLimiter, async (req, res) => {
     const {
         companyName, tin, dateOfIncorporation, countryOfIncorporation,
@@ -148,34 +284,6 @@ router.post('/register', registerLimiter, async (req, res) => {
 
             await transaction.commit();
 
-            // Notify all admins about the new registration
-            const adminIds = await getAdminUserIds(pool);
-            for (const adminUserId of adminIds) {
-                await createNotification(pool, {
-                    userId:   adminUserId,
-                    userType: 'admin',
-                    message:  `New supplier registration: ${companyName} is pending approval.`,
-                    type:     'info',
-                    link:     `/admin/suppliers/${supplierId}`,
-                });
-            }
-
-            // Send registration received email to the supplier
-            try {
-                await sendTemplatedEmail(pool, sql, 'ETT006', email, {
-                    supplierName: companyName,
-                    orgName:      process.env.ORG_NAME || 'Procurement Portal',
-                });
-            } catch (mailErr) {
-                console.error('[mailer] Failed to send registration email:', mailErr.message);
-            }
-
-            // Log audit record for supplier registration    
-            await logAudit(pool, req, {
-                action: 'SUPPLIER_REGISTER', entityType: 'Supplier', entityId: supplierId,
-                description: `New supplier registration: ${companyName} (${email})`,
-                actor: { userId: supplierId, role: 'supplier', email },
-            });
 
             const uploadToken = jwt.sign(
                 { supplierId, purpose: 'document-upload' },
@@ -188,7 +296,48 @@ router.post('/register', registerLimiter, async (req, res) => {
                 supplierId,
                 registrationNumber,
                 uploadToken
-            });    
+            });
+
+            // ── Fire-and-forget post-response side effects ──
+            (async () => {
+                try {
+                    const adminIds = await getAdminUserIds(pool);
+                    await Promise.all(adminIds.map(adminUserId =>
+                        createNotification(pool, {
+                            userId:   adminUserId,
+                            userType: 'admin',
+                            message:  `New supplier registration: ${companyName} is pending approval.`,
+                            type:     'info',
+                            link:     `/admin/suppliers/${supplierId}`,
+                        }).catch(err =>
+                            console.error('[notify admin] Failed for', adminUserId, err.message)
+                        )
+                    ));
+                } catch (notifyErr) {
+                    console.error('[POST /register] Admin notification batch failed:', notifyErr.message);
+                }
+
+                // Send registration received email to the supplier
+                try {
+                    await sendTemplatedEmail(pool, sql, 'ETT006', email, {
+                        supplierName: companyName,
+                        orgName:      process.env.ORG_NAME || 'Procurement Portal',
+                    });
+                } catch (mailErr) {
+                    console.error('[mailer] Failed to send registration email:', mailErr.message);
+                }
+
+                // Log audit record for supplier registration
+                try {
+                    await logAudit(pool, req, {
+                        action: 'SUPPLIER_REGISTER', entityType: 'Supplier', entityId: supplierId,
+                        description: `New supplier registration: ${companyName} (${email})`,
+                        actor: { userId: supplierId, role: 'supplier', email },
+                    });
+                } catch (auditErr) {
+                    console.error('[POST /register] Audit log failed:', auditErr.message);
+                }
+            })();
         } catch (error) {
             await transaction.rollback();
             throw error;
@@ -198,6 +347,7 @@ router.post('/register', registerLimiter, async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 });
+
 
 // ── GET /api/suppliers  — admin only 
 router.get('/', requireAdmin, async (req, res) => {
