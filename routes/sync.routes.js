@@ -4,6 +4,8 @@ const express = require('express');
 const router = express.Router();
 const { mapTenderStatus } = require('../helpers/tenderHelpers');
 const { getPool, sql } = require('../db/procurement');
+const { BlobServiceClient } = require('@azure/storage-blob');
+const { DefaultAzureCredential } = require('@azure/identity');
 
 // ── Status mapping: Admin DB → Supplier DB
 function mapAdminStatusToSupplier(adminStatusId) {
@@ -15,6 +17,33 @@ function mapAdminStatusToSupplier(adminStatusId) {
     };
     return statusMap[adminStatusId] || 'TS001';
 }
+
+// ── Blob client (shared across requests, matches the pattern used for db/procurement.js's pooled connection)
+const CONTAINER_NAME = 'supplier-documents';
+let blobServiceClient = null;
+function getBlobServiceClient() {
+    if (!blobServiceClient) {
+        const accountName = process.env.AZURE_STORAGE_ACCOUNT_NAME;
+        blobServiceClient = new BlobServiceClient(
+            `https://${accountName}.blob.core.windows.net`,
+            new DefaultAzureCredential()
+        );
+    }
+    return blobServiceClient;
+}
+
+// Only allow blob paths shaped like "<SupplierID>/<docType>-<timestamp>.<ext>",
+
+const SAFE_DOC_PATH_PATTERN = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+-\d+\.(pdf|png|jpe?g|docx?)$/i;
+
+const CONTENT_TYPES = {
+    pdf: 'application/pdf',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+};
 
 // ── GET /api/sync/suppliers ──
 router.get('/suppliers', async (req, res) => {
@@ -183,6 +212,101 @@ router.patch('/suppliers/:supplierId/status', async (req, res) => {
     } catch (error) {
         console.error('[PATCH /sync/suppliers/:id/status] Error:', error);
         res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ── GET /api/sync/documents/stream?path=<SupplierID>/<fileName> ──
+// Streams a single supplier document straight from Blob Storage — nothing
+
+router.get('/documents/stream', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const path = req.query.path;
+
+    if (!path || typeof path !== 'string') {
+        return res.status(400).json({ message: 'Missing path query parameter' });
+    }
+
+    if (!SAFE_DOC_PATH_PATTERN.test(path)) {
+        return res.status(400).json({ message: 'Invalid document path' });
+    }
+
+    try {
+        const containerClient = getBlobServiceClient().getContainerClient(CONTAINER_NAME);
+        const blobClient = containerClient.getBlobClient(path);
+
+        const exists = await blobClient.exists();
+        if (!exists) {
+            return res.status(404).json({ message: 'Document not found' });
+        }
+
+        const ext = path.split('.').pop().toLowerCase();
+        const contentType = CONTENT_TYPES[ext] || 'application/octet-stream';
+
+        const downloadResponse = await blobClient.download();
+
+        res.setHeader('Content-Type', contentType);
+        if (downloadResponse.contentLength) {
+            res.setHeader('Content-Length', downloadResponse.contentLength);
+        }
+        // inline, not attachment — HMS renders it in-browser rather than forcing a download
+        res.setHeader('Content-Disposition', 'inline');
+
+        downloadResponse.readableStreamBody.pipe(res);
+    } catch (err) {
+        console.error('[GET /api/sync/documents/stream] Error:', err);
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// ── GET /api/sync/suppliers/documents ──
+// Separate from /api/sync/suppliers - returns just SupplierID + the Documents/Experiences
+// JSON blobs, filtered the same way (CreatedAt/UpdateDate vs lastSyncDate).
+router.get('/suppliers/documents', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { lastSyncDate } = req.query;
+
+    try {
+        const pool = await getPool();
+
+        let query = `
+            SELECT SupplierID, Documents, Experiences, CreatedAt, UpdateDate
+            FROM SupplierProfile
+            WHERE ProfileStatusID IN ('PS002', 'PS001')
+        `;
+
+        if (lastSyncDate) {
+            query += ` AND (CreatedAt > @lastSyncDate OR UpdateDate > @lastSyncDate)`;
+        }
+
+        query += ` ORDER BY CreatedAt DESC`;
+
+        const request = pool.request();
+        if (lastSyncDate) {
+            request.input('lastSyncDate', sql.DateTime, lastSyncDate);
+        }
+
+        const result = await request.query(query);
+
+        res.json({
+            success: true,
+            documents: result.recordset,
+            count: result.recordset.length
+        });
+
+    } catch (err) {
+        console.error('[GET /api/sync/suppliers/documents] Error:', err);
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
     }
 });
 
