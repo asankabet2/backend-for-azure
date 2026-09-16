@@ -768,6 +768,46 @@ router.get('/:supplierId/documents', requireAuth, async (req, res) => {
     }
 });
 
+
+// ── GET /:supplierId/documents/missing — required doc types with no entry at all
+router.get('/:supplierId/documents/missing', requireAuth, async (req, res) => {
+    const { supplierId } = req.params;
+
+    if (req.user.role !== 'admin' && req.user.userId !== supplierId)
+        return res.status(403).json({ message: 'Forbidden: You can only access your own profile' });
+
+    try {
+        const pool   = await getPool();
+        const result = await pool.request()
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`SELECT Documents FROM SupplierProfile WHERE SupplierID = @supplierId`);
+
+        if (result.recordset.length === 0)
+            return res.status(404).json({ message: 'Supplier not found' });
+
+        const documents = result.recordset[0].Documents
+            ? JSON.parse(result.recordset[0].Documents)
+            : [];
+
+        // Any entry at all counts as "present" — Rejected/Replaced included.
+        // Those already have their own re-upload path via /renew.
+        const presentTypes = new Set(documents.map(doc => doc.docType));
+
+        const missing = Object.entries(DOCUMENT_CONFIG)
+            .filter(([docType, cfg]) => cfg.required && !presentTypes.has(docType))
+            .map(([docType, cfg]) => ({
+                docType,
+                name:           cfg.name,
+                requiresExpiry: cfg.requiresExpiry,
+            }));
+
+        res.json(missing);
+    } catch (error) {
+        console.error('[GET missing documents] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
 // ── GET /api/suppliers/:supplierId/documents/:fileName  — serve file 
 router.get('/:supplierId/documents/:fileName', requireAuth, async (req, res) => {
     const { supplierId, fileName } = req.params;
