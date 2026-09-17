@@ -310,4 +310,141 @@ router.get('/suppliers/documents', async (req, res) => {
     }
 });
 
+// ── PATCH /api/sync/suppliers/:supplierId/documents/:docType/status ──
+router.patch('/suppliers/:supplierId/documents/:docType/status', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { supplierId, docType } = req.params;
+    const { status, rejectionReason } = req.body;
+
+    if (!['Verified', 'Rejected'].includes(status)) {
+        return res.status(400).json({ message: 'Invalid status. Must be Verified or Rejected.' });
+    }
+
+    try {
+        const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const result = await transaction.request()
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .query(`
+                    SELECT Documents
+                    FROM SupplierProfile WITH (UPDLOCK, HOLDLOCK)
+                    WHERE SupplierID = @supplierId
+                `);
+
+            if (result.recordset.length === 0) {
+                await transaction.rollback();
+                return res.status(404).json({ message: 'Supplier not found' });
+            }
+
+            let documents = result.recordset[0].Documents
+                ? JSON.parse(result.recordset[0].Documents)
+                : [];
+
+            documents = documents.map(doc =>
+                (doc.docType === docType && doc.status === 'Pending')
+                    ? { ...doc, status, rejectionReason: status === 'Rejected' ? rejectionReason : undefined, verifiedAt: new Date().toISOString() }
+                    : doc
+            );
+
+            await transaction.request()
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .input('documents', sql.NVarChar(sql.MAX), JSON.stringify(documents))
+                .query(`UPDATE SupplierProfile SET Documents = @documents WHERE SupplierID = @supplierId`);
+
+            await transaction.commit();
+
+            res.json({
+                success: true,
+                message: `Document ${status.toLowerCase()} successfully`,
+                documents: JSON.stringify(documents)
+            });
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+    } catch (err) {
+        console.error('[PATCH /api/sync/suppliers/:id/documents/:docType/status] Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ── PATCH /api/sync/suppliers/:supplierId/experiences/:index/status ──
+router.patch('/suppliers/:supplierId/experiences/:index/status', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { supplierId, index } = req.params;
+    const { status, rejectionReason } = req.body;
+    const expIndex = parseInt(index, 10);
+
+    if (!['Verified', 'Rejected'].includes(status)) {
+        return res.status(400).json({ message: 'Invalid status. Must be Verified or Rejected.' });
+    }
+    if (isNaN(expIndex) || expIndex < 0) {
+        return res.status(400).json({ message: 'Invalid experience index.' });
+    }
+
+    try {
+        const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const result = await transaction.request()
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .query(`
+                    SELECT Experiences
+                    FROM SupplierProfile WITH (UPDLOCK, HOLDLOCK)
+                    WHERE SupplierID = @supplierId
+                `);
+
+            if (result.recordset.length === 0) {
+                await transaction.rollback();
+                return res.status(404).json({ message: 'Supplier not found' });
+            }
+
+            let experiences = result.recordset[0].Experiences ? JSON.parse(result.recordset[0].Experiences) : [];
+            if (expIndex >= experiences.length) {
+                await transaction.rollback();
+                return res.status(404).json({ message: 'Experience not found at that index' });
+            }
+
+            experiences[expIndex] = {
+                ...experiences[expIndex],
+                status,
+                rejectionReason: status === 'Rejected' ? (rejectionReason || null) : undefined,
+                verifiedAt: new Date().toISOString(),
+            };
+
+            await transaction.request()
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .input('experiences', sql.NVarChar(sql.MAX), JSON.stringify(experiences))
+                .query(`UPDATE SupplierProfile SET Experiences = @experiences WHERE SupplierID = @supplierId`);
+
+            await transaction.commit();
+
+            res.json({
+                success: true,
+                message: `Experience ${status.toLowerCase()} successfully`,
+                experiences: JSON.stringify(experiences)
+            });
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+    } catch (err) {
+        console.error('[PATCH /api/sync/suppliers/:id/experiences/:index/status] Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 module.exports = router;
