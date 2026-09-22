@@ -68,6 +68,8 @@ EMAIL_USER=no-reply@example.com
 EMAIL_PASS=replace-with-an-app-password
 FRONTEND_URL=http://localhost:3000
 ORG_NAME=Procurement Portal
+
+All saved at Azure Variables
 ```
 
 ## Running the API
