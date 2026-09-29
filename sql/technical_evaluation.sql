@@ -26,3 +26,19 @@ BEGIN
 END
 ELSE
     PRINT 'TechnicalEvaluation table already exists - skipped.';
+
+
+HMS
+CREATE TABLE TenderInterest (
+    TenderID      VARCHAR(50)  NOT NULL,
+    SupplierID    VARCHAR(50)  NOT NULL,
+    InterestDate  DATE         NOT NULL,
+    SyncedAt      DATETIME     NOT NULL CONSTRAINT DF_TenderInterest_SyncedAt DEFAULT GETDATE(),
+    CONSTRAINT PK_TenderInterest PRIMARY KEY CLUSTERED (TenderID, SupplierID)
+);
+
+CREATE NONCLUSTERED INDEX IX_TenderInterest_SupplierID
+    ON TenderInterest (SupplierID);
+
+CREATE NONCLUSTERED INDEX IX_TenderInterest_InterestDate
+    ON TenderInterest (InterestDate);

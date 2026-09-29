@@ -447,4 +447,74 @@ router.patch('/suppliers/:supplierId/experiences/:index/status', async (req, res
     }
 });
 
+// ── GET /api/sync/interests ──
+
+router.get('/interests', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
+        return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { lastSyncDate, tenderId } = req.query;
+
+    let since = null;
+    if (lastSyncDate) {
+        since = new Date(lastSyncDate);
+        if (isNaN(since.getTime())) {
+            return res.status(400).json({ success: false, message: 'Invalid lastSyncDate' });
+        }
+    }
+
+    if (tenderId !== undefined && (typeof tenderId !== 'string' || tenderId.length > 50)) {
+        return res.status(400).json({ success: false, message: 'Invalid tenderId' });
+    }
+
+    try {
+        const pool = await getPool();
+
+        let query = `
+            SELECT
+                i.TenderID,
+                i.SupplierID,
+                i.InterestDate,
+                sp.CompanyName,
+                sp.RegistrationNumber,
+                sp.ContactPerson,
+                sp.Email,
+                sp.Phone
+            FROM Interests i
+            INNER JOIN SupplierProfile sp ON sp.SupplierID = i.SupplierID
+            WHERE 1 = 1
+        `;
+
+        const request = pool.request();
+
+        if (since) {
+            query += ` AND i.InterestDate >= @since`;
+            request.input('since', sql.Date, since);
+        }
+
+        if (tenderId) {
+            query += ` AND i.TenderID = @tenderId`;
+            request.input('tenderId', sql.VarChar(50), tenderId);
+        }
+
+        query += ` ORDER BY i.InterestDate DESC, i.TenderID ASC`;
+
+        const result = await request.query(query);
+
+        res.json({
+            success: true,
+            interests: result.recordset,
+            count: result.recordset.length
+        });
+    } catch (err) {
+        console.error('[GET /api/sync/interests] Error:', err);
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+});
+
 module.exports = router;
