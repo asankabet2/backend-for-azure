@@ -6,6 +6,7 @@ const { mapTenderStatus } = require('../helpers/tenderHelpers');
 const { getPool, sql } = require('../db/procurement');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { DefaultAzureCredential } = require('@azure/identity');
+const crypto = require('crypto');
 
 // ── Status mapping: Admin DB → Supplier DB
 function mapAdminStatusToSupplier(adminStatusId) {
@@ -32,6 +33,12 @@ function getBlobServiceClient() {
     return blobServiceClient;
 }
 
+
+function safeEqual(a, b) {
+    const ab = Buffer.from(String(a || ''));
+    const bb = Buffer.from(String(b || ''));
+    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
 // Only allow blob paths shaped like "<SupplierID>/<docType>-<timestamp>.<ext>",
 
 const SAFE_DOC_PATH_PATTERN = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+-\d+\.(pdf|png|jpe?g|docx?)$/i;
@@ -514,6 +521,99 @@ router.get('/interests', async (req, res) => {
             success: false,
             message: err.message
         });
+    }
+});
+
+
+// ── GET /api/sync/bids ──
+
+router.get('/bids', async (req, res) => {
+    const apiKey = req.headers['x-sync-api-key'];
+    if (!process.env.SYNC_API_KEY || !safeEqual(apiKey, process.env.SYNC_API_KEY)) {
+        return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
+    // ── Validate inputs ──
+    let since = null;
+    if (req.query.lastSyncDate) {
+        since = new Date(req.query.lastSyncDate);
+        if (isNaN(since.getTime())) {
+            return res.status(400).json({ success: false, message: 'Invalid lastSyncDate' });
+        }
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), 1000);
+
+    try {
+        const pool = await getPool();
+
+        // ── Page of bids (fetch limit + 1 to know if more exist) ──
+        const request = pool.request();
+        request.input('limit', sql.Int, limit + 1);
+
+        let query = `
+            SELECT TOP (@limit)
+                b.BidID, b.TenderID, b.SupplierID,
+                b.SubmittedDate, b.GrandTotal, b.BidStatusID,
+                b.CreatedAt
+            FROM Bid b
+            WHERE 1 = 1
+        `;
+        if (since) {
+            request.input('lastSyncDate', sql.DateTime2, since);
+            query += ` AND b.CreatedAt > @lastSyncDate`;
+        }
+        query += ` ORDER BY b.CreatedAt ASC, b.BidID ASC`;
+
+        const bidsRes = await request.query(query);
+        const hasMore = bidsRes.recordset.length > limit;
+        const bids = hasMore ? bidsRes.recordset.slice(0, limit) : bidsRes.recordset;
+
+        if (bids.length === 0) {
+            return res.json({ success: true, bids: [], count: 0, hasMore: false, nextCursor: null });
+        }
+
+        // ── Items for this page only (<= 1000 params, under the 2100 cap) ──
+        const itemsReq = pool.request();
+        const placeholders = bids.map((b, i) => {
+            itemsReq.input(`bid${i}`, sql.VarChar(50), b.BidID);
+            return `@bid${i}`;
+        }).join(',');
+
+        const itemsRes = await itemsReq.query(`
+            SELECT
+                bi.BidID, bi.ItemNo, bi.TenderItemID,
+                bi.Quantity, bi.UnitPrice, bi.Total,
+                ti.DrugID
+            FROM BidItem bi
+            LEFT JOIN TenderItem ti ON bi.TenderItemID = ti.TenderItemID
+            WHERE bi.BidID IN (${placeholders})
+            ORDER BY bi.BidID, bi.ItemNo ASC
+        `);
+
+        const itemMap = {};
+        itemsRes.recordset.forEach(row => {
+            (itemMap[row.BidID] = itemMap[row.BidID] || []).push({
+                itemNo:       row.ItemNo,
+                tenderItemId: row.TenderItemID,
+                drugId:       row.DrugID,      // null if TenderItem is missing
+                quantity:     row.Quantity,
+                unitPrice:    row.UnitPrice,
+                total:        row.Total,
+            });
+        });
+        bids.forEach(b => { b.items = itemMap[b.BidID] || []; });
+
+        const last = bids[bids.length - 1];
+        res.json({
+            success: true,
+            bids,
+            count: bids.length,
+            hasMore,
+            nextCursor: last.CreatedAt,  
+        });
+    } catch (err) {
+        console.error('[GET /api/sync/bids] Error:', err);
+        res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
