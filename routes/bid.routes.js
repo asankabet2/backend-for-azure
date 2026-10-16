@@ -52,7 +52,10 @@ router.get('/', requireAdmin, async (req, res) => {
                 BidID        AS bidId,
                 ItemNo       AS itemNo,
                 TenderItemID AS tenderItemId,
-                Description, Unit, Quantity, UnitPrice, Total
+                Description, Unit, Quantity, UnitPrice, Total,
+                CountryOfOrigin AS countryOfOrigin,
+                PackSize        AS packSize,
+                ExpiryDate      AS expiryDate
             FROM BidItem
             ORDER BY BidID, ItemNo, TenderItemID ASC
         `);
@@ -112,8 +115,11 @@ router.get('/tender/:tenderId', requireAdmin, async (req, res) => {
                     BidID        AS bidId,
                     ItemNo       AS itemNo,
                     TenderItemID AS tenderItemId,
-                    Description, Unit, Quantity, UnitPrice, Total
-                FROM BidItem
+                    Description, Unit, Quantity, UnitPrice, Total,
+                    CountryOfOrigin AS countryOfOrigin,
+                    PackSize        AS packSize,
+                    ExpiryDate      AS expiryDate
+                    FROM BidItem
                 WHERE BidID IN (${placeholders})
                 ORDER BY BidID, ItemNo, TenderItemID ASC
             `);
@@ -181,7 +187,10 @@ router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
                     BidID        AS bidId,
                     ItemNo       AS itemNo,
                     TenderItemID AS tenderItemId,
-                    Description, Unit, Quantity, UnitPrice, Total
+                    Description, Unit, Quantity, UnitPrice, Total,
+                    CountryOfOrigin AS countryOfOrigin,
+                    PackSize        AS packSize,
+                    ExpiryDate      AS expiryDate
                 FROM BidItem
                 WHERE BidID IN (${placeholders})
                 ORDER BY BidID, ItemNo ASC
@@ -198,6 +207,9 @@ router.get('/supplier/:supplierId', requireAuth, async (req, res) => {
                     quantity:     row.Quantity,
                     unitPrice:    row.UnitPrice,
                     total:        row.Total,
+                    countryOfOrigin: row.countryOfOrigin,
+                    packSize:        row.packSize,
+                    expiryDate:      row.expiryDate
                 });
             });
             bids.forEach(bid => { bid.items = itemMap[bid.bidId] || []; });
@@ -329,23 +341,46 @@ router.post('/', requireAuth, async (req, res) => {
                 message: `Item(s) ${unknownItems.map(i => i.itemNo).join(', ')} do not belong to this tender`,
             });
 
-        const invalidItems = items.filter(i => i.quantity <= 0 || i.unitPrice <= 0);
-        if (invalidItems.length > 0)
-            return res.status(400).json({
-                message: `Item(s) ${invalidItems.map(i => i.itemNo).join(', ')} have invalid quantity or unit price`,
-            });
-
-        const overQuantityItems = items.filter(i => {
-            const tenderItem = tenderItemMap[i.tenderItemId];
-            return i.quantity > tenderItem.Quantity;
+        // Quantity is always the tender's requested quantity - client value is ignored
+        const normalizedItems = items.map(i => {
+            const ti = tenderItemMap[i.tenderItemId];
+            return {
+                tenderItemId:    i.tenderItemId,
+                itemNo:          ti.ItemNo,
+                description:     i.description || '',
+                unit:            i.unit || '',
+                quantity:        Number(ti.Quantity),
+                unitPrice:       parseFloat(i.unitPrice),
+                countryOfOrigin: String(i.countryOfOrigin || '').trim(),
+                packSize:        String(i.packSize || '').trim(),
+                expiryDate:      String(i.expiryDate || '').slice(0, 10),
+            };
         });
-        if (overQuantityItems.length > 0)
+
+        const invalidPrice = normalizedItems.filter(i => !(i.unitPrice > 0));
+        if (invalidPrice.length > 0)
             return res.status(400).json({
-                message: `Bid quantity exceeds requested quantity for item(s): ${overQuantityItems.map(i => i.itemNo).join(', ')}`,
+                message: `Item(s) ${invalidPrice.map(i => i.itemNo).join(', ')} have an invalid unit price`,
             });
 
-        const computedGrandTotal = items.reduce((sum, i) => sum + (parseFloat(i.quantity) * parseFloat(i.unitPrice)), 0);
-        if (Math.abs(computedGrandTotal - grandTotal) > 0.01)
+        const missingDetails = normalizedItems.filter(i => !i.countryOfOrigin || !i.packSize || !i.expiryDate);
+        if (missingDetails.length > 0)
+            return res.status(400).json({
+                message: `Country of origin, pack size and expiry date are required for item(s): ${missingDetails.map(i => i.itemNo).join(', ')}`,
+            });
+
+        const badExpiry = normalizedItems.filter(i =>
+            !/^\d{4}-\d{2}-\d{2}$/.test(i.expiryDate) ||
+            isNaN(Date.parse(i.expiryDate)) ||
+            i.expiryDate <= today
+        );
+        if (badExpiry.length > 0)
+            return res.status(400).json({
+                message: `Expiry date must be a valid future date for item(s): ${badExpiry.map(i => i.itemNo).join(', ')}`,
+            });
+
+        const computedGrandTotal = normalizedItems.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
+        if (Math.abs(computedGrandTotal - parseFloat(grandTotal)) > 0.01)
             return res.status(400).json({ message: 'Grand total does not match sum of item totals' });
 
         const transaction = new sql.Transaction(pool);
@@ -364,22 +399,27 @@ router.post('/', requireAuth, async (req, res) => {
                     VALUES (@bidId, @tenderId, @supplierId, @submittedDate, @grandTotal, @bidStatusId, GETDATE())
                 `);
 
-            for (const item of items) {
-                const itemTotal = parseFloat(item.quantity) * parseFloat(item.unitPrice);
+            for (const item of normalizedItems) {
+                const itemTotal = item.quantity * item.unitPrice;
                 await transaction.request()
-                    .input('bidId',        sql.VarChar(50),       bidId)
-                    .input('itemNo',       sql.Int,               item.itemNo)
-                    .input('description',  sql.NVarChar(sql.MAX), item.description  || '')
-                    .input('unit',         sql.NVarChar(50),      item.unit         || '')
-                    .input('quantity',     sql.Decimal(18, 2),    item.quantity)
-                    .input('unitPrice',    sql.Decimal(18, 2),    item.unitPrice)
-                    .input('total',        sql.Decimal(18, 2),    itemTotal)
-                    .input('tenderItemId', sql.VarChar(50),       item.tenderItemId)
+                    .input('bidId',           sql.VarChar(50),       bidId)
+                    .input('itemNo',          sql.Int,               item.itemNo)
+                    .input('description',     sql.NVarChar(sql.MAX), item.description)
+                    .input('unit',            sql.NVarChar(50),      item.unit)
+                    .input('quantity',        sql.Decimal(18, 2),    item.quantity)
+                    .input('unitPrice',       sql.Decimal(18, 2),    item.unitPrice)
+                    .input('total',           sql.Decimal(18, 2),    itemTotal)
+                    .input('tenderItemId',    sql.VarChar(50),       item.tenderItemId)
+                    .input('countryOfOrigin', sql.NVarChar(100),     item.countryOfOrigin)
+                    .input('packSize',        sql.NVarChar(100),     item.packSize)
+                    .input('expiryDate',      sql.Date,              new Date(`${item.expiryDate}T00:00:00Z`))
                     .query(`
                         INSERT INTO BidItem
-                            (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt, TenderItemID)
+                            (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt,
+                             TenderItemID, CountryOfOrigin, PackSize, ExpiryDate)
                         VALUES
-                            (@bidId, @itemNo, @description, @unit, @quantity, @unitPrice, @total, GETDATE(), @tenderItemId)
+                            (@bidId, @itemNo, @description, @unit, @quantity, @unitPrice, @total, GETDATE(),
+                             @tenderItemId, @countryOfOrigin, @packSize, @expiryDate)
                     `);
             }
 
@@ -428,7 +468,6 @@ router.post('/', requireAuth, async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 });
-
 
 // ── 5. PATCH /api/bids/:id/status  — admin: award / reject
 router.patch('/:id/status', requireAdmin, async (req, res) => {
