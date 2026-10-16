@@ -526,7 +526,6 @@ router.get('/interests', async (req, res) => {
 
 
 // ── GET /api/sync/bids ──
-
 router.get('/bids', async (req, res) => {
     const apiKey = req.headers['x-sync-api-key'];
     if (!process.env.SYNC_API_KEY || !safeEqual(apiKey, process.env.SYNC_API_KEY)) {
@@ -583,6 +582,7 @@ router.get('/bids', async (req, res) => {
             SELECT
                 bi.BidID, bi.ItemNo, bi.TenderItemID,
                 bi.Quantity, bi.UnitPrice, bi.Total,
+                bi.CountryOfOrigin, bi.PackSize, bi.ExpiryDate,
                 ti.DrugID
             FROM BidItem bi
             LEFT JOIN TenderItem ti ON bi.TenderItemID = ti.TenderItemID
@@ -593,12 +593,18 @@ router.get('/bids', async (req, res) => {
         const itemMap = {};
         itemsRes.recordset.forEach(row => {
             (itemMap[row.BidID] = itemMap[row.BidID] || []).push({
-                itemNo:       row.ItemNo,
-                tenderItemId: row.TenderItemID,
-                drugId:       row.DrugID,      // null if TenderItem is missing
-                quantity:     row.Quantity,
-                unitPrice:    row.UnitPrice,
-                total:        row.Total,
+                itemNo:          row.ItemNo,
+                tenderItemId:    row.TenderItemID,
+                drugId:          row.DrugID,      // null if TenderItem is missing
+                quantity:        row.Quantity,
+                unitPrice:       row.UnitPrice,
+                total:           row.Total,
+                countryOfOrigin: row.CountryOfOrigin || null,
+                packSize:        row.PackSize || null,
+                // SQL DATE -> plain YYYY-MM-DD string (no timezone shift for HMS)
+                expiryDate:      row.ExpiryDate
+                                    ? new Date(row.ExpiryDate).toISOString().slice(0, 10)
+                                    : null,
             });
         });
         bids.forEach(b => { b.items = itemMap[b.BidID] || []; });
@@ -609,7 +615,7 @@ router.get('/bids', async (req, res) => {
             bids,
             count: bids.length,
             hasMore,
-            nextCursor: last.CreatedAt,  
+            nextCursor: last.CreatedAt,
         });
     } catch (err) {
         console.error('[GET /api/sync/bids] Error:', err);

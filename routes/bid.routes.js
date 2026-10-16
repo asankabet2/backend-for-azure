@@ -891,21 +891,24 @@ router.get('/:bidId', requireAuth, async (req, res) => {
 
         const bid         = result.recordset[0];
         const itemsResult = await pool.request()
-            .input('bidId', sql.VarChar(50), bidId)
-            .query(`
-                SELECT
-                    ItemNo       AS itemNo,
-                    TenderItemID AS tenderItemId,
-                    Description  AS description,
-                    Unit         AS unit,
-                    Quantity     AS quantity,
-                    UnitPrice    AS unitPrice,
-                    Total        AS total
-                FROM BidItem
-                WHERE BidID = @bidId
-                ORDER BY ItemNo ASC
+        .input('bidId', sql.VarChar(50), bidId)
+        .query(`
+            SELECT
+                ItemNo          AS itemNo,
+                TenderItemID    AS tenderItemId,
+                Description     AS description,
+                Unit            AS unit,
+                Quantity        AS quantity,
+                UnitPrice       AS unitPrice,
+                Total           AS total,
+                CountryOfOrigin AS countryOfOrigin,
+                PackSize        AS packSize,
+                ExpiryDate      AS expiryDate
+            FROM BidItem
+            WHERE BidID = @bidId
+            ORDER BY ItemNo ASC
             `);
-
+            
         bid.items = itemsResult.recordset;
         res.json(bid);
 
