@@ -318,23 +318,35 @@ router.get('/suppliers/documents', async (req, res) => {
 });
 
 // ── PATCH /api/sync/suppliers/:supplierId/documents/:docType/status ──
+// Returns only the changed document info, not the whole Documents array.
 router.patch('/suppliers/:supplierId/documents/:docType/status', async (req, res) => {
+    const t0 = Date.now();
+    const tag = `[doc-status ${req.params.supplierId}/${req.params.docType}]`;
+    console.log(`${tag} START`);
+
+    res.on('close', () => {
+        console.log(`${tag} CLOSE after ${Date.now() - t0}ms, replyFinished=${res.writableFinished}`);
+    });
+
     const apiKey = req.headers['x-sync-api-key'];
     if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
-        return res.status(401).json({ message: 'Unauthorized' });
+        return res.status(401).json({ success: false, message: 'Unauthorized' });
     }
 
     const { supplierId, docType } = req.params;
     const { status, rejectionReason } = req.body;
 
     if (!['Verified', 'Rejected'].includes(status)) {
-        return res.status(400).json({ message: 'Invalid status. Must be Verified or Rejected.' });
+        return res.status(400).json({ success: false, message: 'Invalid status. Must be Verified or Rejected.' });
     }
 
     try {
         const pool = await getPool();
+        console.log(`${tag} pool ready +${Date.now() - t0}ms`);
+
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
+        console.log(`${tag} tx begun +${Date.now() - t0}ms`);
 
         try {
             const result = await transaction.request()
@@ -344,43 +356,63 @@ router.patch('/suppliers/:supplierId/documents/:docType/status', async (req, res
                     FROM SupplierProfile WITH (UPDLOCK, HOLDLOCK)
                     WHERE SupplierID = @supplierId
                 `);
+            console.log(`${tag} row locked +${Date.now() - t0}ms`);
 
             if (result.recordset.length === 0) {
                 await transaction.rollback();
-                return res.status(404).json({ message: 'Supplier not found' });
+                return res.status(404).json({ success: false, message: 'Supplier not found' });
             }
 
             let documents = result.recordset[0].Documents
                 ? JSON.parse(result.recordset[0].Documents)
                 : [];
 
-            documents = documents.map(doc =>
-                (doc.docType === docType && doc.status === 'Pending')
-                    ? { ...doc, status, rejectionReason: status === 'Rejected' ? rejectionReason : undefined, verifiedAt: new Date().toISOString() }
-                    : doc
-            );
+            const verifiedAt = new Date().toISOString();
+            let updatedCount = 0;
+
+            documents = documents.map(doc => {
+                if (doc.docType === docType && doc.status === 'Pending') {
+                    updatedCount++;
+                    return {
+                        ...doc,
+                        status,
+                        rejectionReason: status === 'Rejected' ? rejectionReason : undefined,
+                        verifiedAt
+                    };
+                }
+                return doc;
+            });
+
+            const documentsJson = JSON.stringify(documents);
 
             await transaction.request()
                 .input('supplierId', sql.VarChar(50), supplierId)
-                .input('documents', sql.NVarChar(sql.MAX), JSON.stringify(documents))
+                .input('documents', sql.NVarChar(sql.MAX), documentsJson)
                 .query(`UPDATE SupplierProfile SET Documents = @documents WHERE SupplierID = @supplierId`);
 
             await transaction.commit();
+            console.log(`${tag} committed +${Date.now() - t0}ms, stored=${documentsJson.length} chars, updatedCount=${updatedCount}`);
 
             res.json({
                 success: true,
                 message: `Document ${status.toLowerCase()} successfully`,
-                documents: JSON.stringify(documents)
+                docType,
+                status,
+                rejectionReason: status === 'Rejected' ? rejectionReason : null,
+                verifiedAt,
+                updatedCount
             });
+            console.log(`${tag} res.json called +${Date.now() - t0}ms`);
         } catch (err) {
             await transaction.rollback();
             throw err;
         }
     } catch (err) {
-        console.error('[PATCH /api/sync/suppliers/:id/documents/:docType/status] Error:', err);
+        console.error(`${tag} ERROR +${Date.now() - t0}ms:`, err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 // ── PATCH /api/sync/suppliers/:supplierId/experiences/:index/status ──
 router.patch('/suppliers/:supplierId/experiences/:index/status', async (req, res) => {
