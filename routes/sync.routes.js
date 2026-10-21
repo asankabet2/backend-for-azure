@@ -19,6 +19,33 @@ function mapAdminStatusToSupplier(adminStatusId) {
     return statusMap[adminStatusId] || 'TS001';
 }
 
+// ── Tender type (HMS DrugTenderType) → portal TenderCategory
+const TYPE_TO_CATEGORY = {
+    'S001':   'CAT0002', // DRUGS            → Pharmaceuticals
+    'S002':   'CAT0001', // SURGICAL EQUIP   → Medical Supplies
+    'STY001': 'CAT0010', // Other            → Other
+    'STY002': 'CAT0004', // Stationery       → Office Supplies
+    'STY003': 'CAT0003', // IT & Electronics → IT & Electronics
+    'STY004': 'CAT0005', // Cleaning & Sanitation
+    'STY005': 'CAT0007', // Catering
+    'STY006': 'CAT0008', // Construction
+    'STY007': 'CAT0009', // Consultancy
+    'STY009': 'CAT0007', // Food Items       → Catering
+};
+
+const DEFAULT_REQUIRED_DOCUMENTS = JSON.stringify([
+    'fdaCertificate', 'graClearance', 'ssnitClearance', 'ppaCertificate'
+]);
+
+// e.g. DT000002-0000114 (tender ID + drug ID, so it is the same every time)
+function newTenderItemId(tenderId, drugId) {
+    const id = `${tenderId}-${drugId}`;
+    if (id.length > 50) {
+        throw new Error(`TenderItemID for tender ${tenderId} / drug ${drugId} is longer than 50 characters`);
+    }
+    return id;
+}
+
 // ── Blob client (shared across requests, matches the pattern used for db/procurement.js's pooled connection)
 const CONTAINER_NAME = 'supplier-documents';
 let blobServiceClient = null;
@@ -128,7 +155,9 @@ router.get('/suppliers', async (req, res) => {
     }
 });
 
+
 // ── POST /api/sync/tenders ──
+// Upserts a tender and (optionally) its items in one transaction.
 router.post('/tenders', async (req, res) => {
     const apiKey = req.headers['x-sync-api-key'];
     if (!apiKey || apiKey !== process.env.SYNC_API_KEY) {
@@ -136,56 +165,118 @@ router.post('/tenders', async (req, res) => {
     }
 
     const {
-        drugtenderid, drugtendername, drugtendercatid, drugtenderstatusid,
-        tenderstartdate, tenderenddate, tenderinfo1, tenderdate1, tendervalue1,
+        drugtenderid, drugtendername, drugtendercatid, drugtendertypeid, drugtenderstatusid,
+        tenderstartdate, tenderenddate, tenderinfo1, remarks, tenderdate1, tendervalue1, items,
     } = req.body;
 
+    if (!drugtenderid || !drugtendername) {
+        return res.status(400).json({ success: false, message: 'drugtenderid and drugtendername are required' });
+    }
+
+    // New HMS flow sends the tender type; the old flow sent the HMS category directly
+    let categoryId = drugtendercatid || null;
+    if (drugtendertypeid) {
+        categoryId = TYPE_TO_CATEGORY[drugtendertypeid];
+        if (!categoryId) {
+            return res.status(400).json({
+                success: false,
+                message: `Tender type ${drugtendertypeid} has no matching portal category`
+            });
+        }
+    }
+
     const tenderStatusId = mapAdminStatusToSupplier(drugtenderstatusid);
+    const itemList = Array.isArray(items) ? items : [];
 
     try {
         const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
 
-        await pool.request()
-            .input('tenderId',        sql.VarChar(50),       drugtenderid)
-            .input('title',           sql.NVarChar(255),     drugtendername)
-            .input('categoryId',      sql.VarChar(20),       drugtendercatid)
-            .input('description',     sql.NVarChar(sql.MAX), tenderinfo1 || '')
-            .input('statusId',        sql.VarChar(20),       tenderStatusId)
-            .input('publishedDate',   sql.Date,              tenderdate1 || null)
-            .input('openingDate',     sql.Date,              tenderstartdate || null)
-            .input('closingDate',     sql.Date,              tenderenddate || null)
-            .input('estimatedBudget', sql.Decimal(18, 2),    tendervalue1 || 0)
-            .query(`
-                IF EXISTS (SELECT 1 FROM Tender WHERE TenderID = @tenderId)
-                    UPDATE Tender SET
-                        Title           = @title,
-                        CategoryID      = @categoryId,
-                        Description     = @description,
-                        TenderStatusID  = @statusId,
-                        PublishedDate   = @publishedDate,
-                        OpeningDate     = @openingDate,
-                        ClosingDate     = @closingDate,
-                        EstimatedBudget = @estimatedBudget,
-                        UpdatedAt       = GETDATE()
-                    WHERE TenderID = @tenderId
-                ELSE
-                    INSERT INTO Tender (
-                        TenderID, Title, CategoryID, Description, TenderStatusID,
-                        PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
-                        CreatedAt, UpdatedAt
-                    ) VALUES (
-                        @tenderId, @title, @categoryId, @description, @statusId,
-                        @publishedDate, @openingDate, @closingDate, @estimatedBudget,
-                        GETDATE(), GETDATE()
-                    )
-            `);
+        try {
+            await transaction.request()
+                .input('tenderId',        sql.VarChar(50),       drugtenderid)
+                .input('title',           sql.NVarChar(255),     drugtendername)
+                .input('categoryId',      sql.VarChar(20),       categoryId)
+                .input('description',     sql.NVarChar(sql.MAX), tenderinfo1 || remarks || '')
+                .input('statusId',        sql.VarChar(20),       tenderStatusId)
+                .input('publishedDate',   sql.Date,              tenderdate1 || null)
+                .input('openingDate',     sql.Date,              tenderstartdate || null)
+                .input('closingDate',     sql.Date,              tenderenddate || null)
+                .input('estimatedBudget', sql.Decimal(18, 2),    tendervalue1 || 0)
+                .input('requiredDocs',    sql.NVarChar(sql.MAX), DEFAULT_REQUIRED_DOCUMENTS)
+                .query(`
+                    IF EXISTS (SELECT 1 FROM Tender WHERE TenderID = @tenderId)
+                        UPDATE Tender SET
+                            Title           = @title,
+                            CategoryID      = @categoryId,
+                            Description     = @description,
+                            TenderStatusID  = @statusId,
+                            PublishedDate   = @publishedDate,
+                            OpeningDate     = @openingDate,
+                            ClosingDate     = @closingDate,
+                            EstimatedBudget = @estimatedBudget,
+                            UpdatedAt       = GETDATE()
+                        WHERE TenderID = @tenderId
+                    ELSE
+                        INSERT INTO Tender (
+                            TenderID, Title, CategoryID, Description, TenderStatusID,
+                            PublishedDate, OpeningDate, ClosingDate, EstimatedBudget,
+                            RequiredDocuments, CreatedAt, UpdatedAt
+                        ) VALUES (
+                            @tenderId, @title, @categoryId, @description, @statusId,
+                            @publishedDate, @openingDate, @closingDate, @estimatedBudget,
+                            @requiredDocs, GETDATE(), GETDATE()
+                        )
+                `);
 
-        res.json({ success: true });
+            // Items are matched on TenderID + DrugID so a re-push never duplicates them.
+            // Existing TenderItemIDs and ItemNos are left alone because bids point at them.
+            for (let i = 0; i < itemList.length; i++) {
+                const it = itemList[i];
+                if (!it || !it.drugId) {
+                    throw new Error(`Item ${i + 1} has no drugId`);
+                }
+                await transaction.request()
+                    .input('tenderId',    sql.VarChar(50),    drugtenderid)
+                    .input('drugId',      sql.VarChar(50),    it.drugId)
+                    .input('itemId',      sql.VarChar(50),    newTenderItemId(drugtenderid, it.drugId))
+                    .input('itemNo',      sql.Int,            it.itemNo || i + 1)
+                    .input('description', sql.NVarChar(255),  it.description || '')
+                    .input('unit',        sql.NVarChar(50),   it.unit || '')
+                    .input('quantity',    sql.Decimal(18, 2), it.quantity || 0)
+                    .input('unitPrice',   sql.Decimal(18, 4), it.estimatedUnitPrice || 0)
+                    .query(`
+                        IF EXISTS (SELECT 1 FROM TenderItem WHERE TenderID = @tenderId AND DrugID = @drugId)
+                            UPDATE TenderItem SET
+                                Description        = @description,
+                                Unit               = @unit,
+                                Quantity           = @quantity,
+                                EstimatedUnitPrice = @unitPrice
+                            WHERE TenderID = @tenderId AND DrugID = @drugId
+                        ELSE
+                            INSERT INTO TenderItem (
+                                TenderItemID, TenderID, ItemNo, Description, Unit,
+                                Quantity, EstimatedUnitPrice, CreatedAt, DrugID
+                            ) VALUES (
+                                @itemId, @tenderId, @itemNo, @description, @unit,
+                                @quantity, @unitPrice, GETDATE(), @drugId
+                            )
+                    `);
+            }
+
+            await transaction.commit();
+            res.json({ success: true, items: itemList.length });
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
     } catch (err) {
         console.error('[POST /api/sync/tenders] Error:', err);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 // ── PATCH /api/sync/suppliers/:supplierId/status ──
 router.patch('/suppliers/:supplierId/status', async (req, res) => {

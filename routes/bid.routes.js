@@ -12,16 +12,6 @@ const { logAudit }                    = require('../helpers/audit');
 const { sendTemplatedEmail }          = require('../helpers/mailers');
 const { checkAwardEligibility }       = require('../helpers/evaluationHelpers');
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ROUTE ORDER (important — Express matches top-to-bottom):
-//   1. GET  /                          admin: all bids
-//   2. GET  /tender/:tenderId          admin: bids for a tender
-//   3. GET  /supplier/:supplierId      supplier: their own bids
-//   4. POST /                          submit a bid
-//   5. PATCH /:id/status               admin: award / reject
-//   6. GET  /:bidId/download           PDF receipt   ← MUST be before /:bidId
-//   7. GET  /:bidId                    single bid    ← wildcard, always last
-// ─────────────────────────────────────────────────────────────────────────────
 
 
 // ── 1. GET /api/bids  — admin: all bids
@@ -238,7 +228,11 @@ router.post('/', requireAuth, async (req, res) => {
 
         const tenderInfo = await pool.request()
             .input('tenderId', sql.VarChar(50), tenderId)
-            .query(`SELECT Title, TenderStatusID FROM Tender WHERE TenderID = @tenderId`);
+            .query(`
+                SELECT Title, TenderStatusID, ClosingDate,
+                       CASE WHEN ClosingDate IS NOT NULL AND ClosingDate <= GETDATE() THEN 1 ELSE 0 END AS IsPastClosing
+                FROM Tender WHERE TenderID = @tenderId
+            `);
 
         if (tenderInfo.recordset.length === 0)
             return res.status(404).json({ message: 'Tender not found' });
@@ -247,6 +241,8 @@ router.post('/', requireAuth, async (req, res) => {
         if (tenderRow.TenderStatusID !== 'TS002')
             return res.status(400).json({ message: 'This tender is not open for bidding' });
 
+        if (tenderRow.IsPastClosing === 1)
+            return res.status(400).json({ message: 'The closing date for this tender has passed' });
         const tenderTitle = tenderRow.Title || 'a tender';
 
         const supplierInfo = await pool.request()
@@ -276,11 +272,15 @@ router.post('/', requireAuth, async (req, res) => {
             return res.status(400).json({ message: 'You have already submitted a bid for this tender' });
 
         const today = new Date().toISOString().split('T')[0];
-        const complianceCheck = await pool.request()
+
+        // Expired documents do NOT block the bid. They are reported to the supplier
+        // after the bid is saved so they can renew before evaluation starts.
+        const expiredDocsRes = await pool.request()
             .input('supplierId', sql.VarChar(50), supplierId)
             .input('today',      sql.VarChar(10), today)
             .query(`
-                SELECT d.[value] AS doc
+                SELECT JSON_VALUE(d.[value], '$.docType')    AS docType,
+                       JSON_VALUE(d.[value], '$.expiryDate') AS expiryDate
                 FROM SupplierProfile sp
                 CROSS APPLY OPENJSON(sp.Documents) d
                 WHERE sp.SupplierID = @supplierId
@@ -288,9 +288,7 @@ router.post('/', requireAuth, async (req, res) => {
                   AND JSON_VALUE(d.[value], '$.expiryDate')     < @today
                   AND JSON_VALUE(d.[value], '$.status')         = 'Verified'
             `);
-
-        if (complianceCheck.recordset.length > 0)
-            return res.status(403).json({ message: 'You have expired documents. Please renew them before submitting a bid.' });
+        const expiredDocs = expiredDocsRes.recordset;
 
         const rejectedDocCheck = await pool.request()
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -450,14 +448,45 @@ router.post('/', requireAuth, async (req, res) => {
                 console.error('[mailer] Failed to send bid confirmation email:', mailErr.message);
             }
 
+            // Tell the supplier to renew expired documents before evaluation starts.
+            // The bid is already saved, so a failure here must never undo it.
+            let warning = null;
+            if (expiredDocs.length > 0) {
+                const count    = expiredDocs.length;
+                const docNames = expiredDocs.map(d => d.docType || 'a document').join(', ');
+                const closing  = tenderRow.ClosingDate
+                    ? new Date(tenderRow.ClosingDate).toISOString().slice(0, 10)
+                    : null;
+                const message =
+                    `Your bid was submitted, but ${count === 1 ? 'one of your documents has' : `${count} of your documents have`} expired (${docNames}). ` +
+                    `Please renew ${count === 1 ? 'it' : 'them'} before the evaluation process starts` +
+                    (closing ? ` (the tender closes on ${closing}).` : '.');
+
+                warning = { code: 'EXPIRED_DOCUMENTS', message, documents: expiredDocs };
+
+                try {
+                    await createNotification(pool, {
+                        userId:   supplierId,
+                        userType: 'supplier',
+                        message,
+                        type:     'warning',
+                        link:     '/supplier/documents',
+                    });
+                } catch (notifErr) {
+                    console.error('[notify] Failed to send expired-document notice:', notifErr.message);
+                }
+            }
+
             await logAudit(pool, req, {
                 action: 'BID_SUBMIT', entityType: 'Bid', entityId: bidId,
-                description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})`,
+                description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})` +
+                             (expiredDocs.length ? ` with ${expiredDocs.length} expired document(s)` : ''),
             });
 
             res.status(201).json({
                 message: 'Bid submitted successfully',
                 bid:     { bidId, tenderId, supplierId, grandTotal: computedGrandTotal },
+                warning,
             });
         } catch (error) {
             await transaction.rollback();

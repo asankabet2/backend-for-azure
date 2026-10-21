@@ -466,8 +466,7 @@ router.get('/:id/interests', requireAdmin, async (req, res) => {
     }
 });
 
-
-// ── POST /api/tenders/:id/interest  — auth required
+// ── POST /api/tenders/:id/interest  — supplier only
 router.post('/:id/interest', requireAuth, async (req, res) => {
     const { id }           = req.params;
     const { supplierId }   = req.body;
@@ -480,7 +479,27 @@ router.post('/:id/interest', requireAuth, async (req, res) => {
         return res.status(403).json({ message: 'You can only express interest on your own behalf' });
 
     try {
-        const pool     = await getPool();
+        const pool = await getPool();
+
+        // Tender must exist, be Open, and not be past its closing date
+        const tenderCheck = await pool.request()
+            .input('tenderId', sql.VarChar(50), id)
+            .query(`
+                SELECT TenderStatusID,
+                       CASE WHEN ClosingDate IS NOT NULL AND ClosingDate <= GETDATE() THEN 1 ELSE 0 END AS IsPastClosing
+                FROM Tender WHERE TenderID = @tenderId
+            `);
+
+        if (tenderCheck.recordset.length === 0)
+            return res.status(404).json({ message: 'Tender not found' });
+
+        const tenderRow = tenderCheck.recordset[0];
+        if (tenderRow.TenderStatusID !== 'TS002')
+            return res.status(400).json({ message: 'This tender is not open' });
+
+        if (tenderRow.IsPastClosing === 1)
+            return res.status(400).json({ message: 'The closing date for this tender has passed' });
+
         const existing = await pool.request()
             .input('tenderId',   sql.VarChar(50), id)
             .input('supplierId', sql.VarChar(50), supplierId)
@@ -525,7 +544,6 @@ router.post('/:id/interest', requireAuth, async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 });
-
 
 // ── GET /api/tenders/:tenderId/items/:itemNo/awards  — admin only
 router.get('/:tenderId/items/:itemNo/awards', requireAdmin, async (req, res) => {
