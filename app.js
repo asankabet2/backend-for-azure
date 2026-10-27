@@ -28,6 +28,7 @@ const app = express();
 
 // Middleware
 app.use(cors());
+app.use('/api/sync', express.json({ limit: '10mb' }));  // sync route only, must come before the global parser
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
