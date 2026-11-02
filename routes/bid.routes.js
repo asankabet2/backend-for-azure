@@ -3,6 +3,8 @@
 const express    = require('express');
 const router     = express.Router();
 const PDFDocument = require('pdfkit');
+const path = require('path');
+const fs   = require('fs');
 
 const { requireAuth, requireAdmin }   = require('../middleware/auth');
 const { getPool, sql }                = require('../db/procurement');
@@ -792,6 +794,18 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="Bid_${bidId}_Receipt.pdf"`);
         doc.pipe(res);
+
+        // Logo (top left, same band as the title)
+        const logoPath = path.join(__dirname, '..', 'assets', 'logo.png');
+        const headerY  = doc.y;
+        if (fs.existsSync(logoPath)) {
+            try {
+                doc.image(logoPath, 50, 40, { fit: [70, 55] });
+            } catch (logoErr) {
+                console.error('[Download Bid PDF] Logo failed to load:', logoErr.message);
+            }
+            doc.y = headerY;
+        }
 
         // Header
         doc.fontSize(20).font('Helvetica-Bold').text('BID CONFIRMATION RECEIPT', { align: 'center' });
