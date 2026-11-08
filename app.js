@@ -22,13 +22,16 @@ const evaluationRoutes = require('./routes/evaluation.routes');
 const panelMembersRoutes = require('./routes/panelMembers.routes');
 const criteriaLibraryRoutes = require('./routes/criteriaLibrary.routes');
 const emailRoutes = require('./routes/email.routes');
+const compression = require('compression');   
 
 
 const app = express();
 
 // Middleware
 app.use(cors());
+app.use(compression());  // compress all responses
 app.use('/api/sync', express.json({ limit: '10mb' }));  // sync route only, must come before the global parser
+app.use('/api/bids', express.json({ limit: '10mb' })); // large bid submissions and full draft replace
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 

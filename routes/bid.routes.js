@@ -399,59 +399,54 @@ router.post('/', requireAuth, async (req, res) => {
                     VALUES (@bidId, @tenderId, @supplierId, @submittedDate, @grandTotal, @bidStatusId, GETDATE())
                 `);
 
-            for (const item of normalizedItems) {
-                const itemTotal = item.quantity * item.unitPrice;
-                await transaction.request()
-                    .input('bidId',           sql.VarChar(50),       bidId)
-                    .input('itemNo',          sql.Int,               item.itemNo)
-                    .input('description',     sql.NVarChar(sql.MAX), item.description)
-                    .input('unit',            sql.NVarChar(50),      item.unit)
-                    .input('quantity',        sql.Decimal(18, 2),    item.quantity)
-                    .input('unitPrice',       sql.Decimal(18, 2),    item.unitPrice)
-                    .input('total',           sql.Decimal(18, 2),    itemTotal)
-                    .input('tenderItemId',    sql.VarChar(50),       item.tenderItemId)
-                    .input('countryOfOrigin', sql.NVarChar(100),     item.countryOfOrigin)
-                    .input('packSize',        sql.NVarChar(100),     item.packSize)
-                    .input('expiryDate',      sql.Date,              new Date(`${item.expiryDate}T00:00:00Z`))
-                    .query(`
-                        INSERT INTO BidItem
-                            (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt,
-                             TenderItemID, CountryOfOrigin, PackSize, ExpiryDate)
-                        VALUES
-                            (@bidId, @itemNo, @description, @unit, @quantity, @unitPrice, @total, GETDATE(),
-                             @tenderItemId, @countryOfOrigin, @packSize, @expiryDate)
-                    `);
-            }
+                // Insert every item in one statement (one round trip) instead of one INSERT per item
+            const itemsJson = JSON.stringify(normalizedItems.map(i => ({
+                itemNo:          i.itemNo,
+                description:     i.description,
+                unit:            i.unit,
+                quantity:        i.quantity,
+                unitPrice:       i.unitPrice,
+                total:           Math.round(i.quantity * i.unitPrice * 100) / 100,
+                tenderItemId:    i.tenderItemId,
+                countryOfOrigin: i.countryOfOrigin,
+                packSize:        i.packSize,
+                expiryDate:      i.expiryDate,
+            })));
+
+            await transaction.request()
+                .input('bidId', sql.VarChar(50),       bidId)
+                .input('items', sql.NVarChar(sql.MAX), itemsJson)
+                .query(`
+                    INSERT INTO BidItem
+                        (BidID, ItemNo, Description, Unit, Quantity, UnitPrice, Total, CreatedAt,
+                         TenderItemID, CountryOfOrigin, PackSize, ExpiryDate)
+                    SELECT @bidId, j.itemNo, j.description, j.unit, j.quantity, j.unitPrice, j.total, GETDATE(),
+                           j.tenderItemId, j.countryOfOrigin, j.packSize, j.expiryDate
+                    FROM OPENJSON(@items) WITH (
+                        itemNo          INT           '$.itemNo',
+                        description     NVARCHAR(MAX) '$.description',
+                        unit            NVARCHAR(50)  '$.unit',
+                        quantity        DECIMAL(18,2) '$.quantity',
+                        unitPrice       DECIMAL(18,2) '$.unitPrice',
+                        total           DECIMAL(18,2) '$.total',
+                        tenderItemId    VARCHAR(50)   '$.tenderItemId',
+                        countryOfOrigin NVARCHAR(100) '$.countryOfOrigin',
+                        packSize        NVARCHAR(100) '$.packSize',
+                        expiryDate      DATE          '$.expiryDate'
+                    ) AS j
+                `);
+
+            // Remove any existing draft for this tender/supplier
+            await transaction.request()
+                .input('tenderId',   sql.VarChar(50), tenderId)
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .query(`DELETE FROM BidDraft WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
 
             await transaction.commit();
 
-            const adminIds = await getAdminUserIds(pool);
-            for (const adminUserId of adminIds) {
-                await createNotification(pool, {
-                    userId:   adminUserId,
-                    userType: 'admin',
-                    message:  `${companyName} submitted a bid for "${tenderTitle}".`,
-                    type:     'info',
-                    link:     `/admin/tenders/${tenderId}`,
-                });
-            }
+            // ── The bid is saved from here on. Nothing below may turn this request into a failure. ──
 
-            try {
-                if (supplierEmail) {
-                    await sendTemplatedEmail(pool, sql, 'ETT004', supplierEmail, {
-                        supplierName:  companyName,
-                        tenderTitle,
-                        bidId,
-                        submittedDate: submittedDate || today,
-                        orgName:       process.env.ORG_NAME || 'Procurement Portal',
-                    });
-                }
-            } catch (mailErr) {
-                console.error('[mailer] Failed to send bid confirmation email:', mailErr.message);
-            }
-
-            // Tell the supplier to renew expired documents before evaluation starts.
-            // The bid is already saved, so a failure here must never undo it.
+            // Expired-document warning for the response (built now, notified in the background)
             let warning = null;
             if (expiredDocs.length > 0) {
                 const count    = expiredDocs.length;
@@ -465,25 +460,63 @@ router.post('/', requireAuth, async (req, res) => {
                     (closing ? ` (the tender closes on ${closing}).` : '.');
 
                 warning = { code: 'EXPIRED_DOCUMENTS', message, documents: expiredDocs };
-
-                try {
-                    await createNotification(pool, {
-                        userId:   supplierId,
-                        userType: 'supplier',
-                        message,
-                        type:     'warning',
-                        link:     '/supplier/documents',
-                    });
-                } catch (notifErr) {
-                    console.error('[notify] Failed to send expired-document notice:', notifErr.message);
-                }
             }
 
-            await logAudit(pool, req, {
-                action: 'BID_SUBMIT', entityType: 'Bid', entityId: bidId,
-                description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})` +
-                             (expiredDocs.length ? ` with ${expiredDocs.length} expired document(s)` : ''),
-            });
+            // Background work: not awaited, so the supplier isn't kept waiting on SMTP or notifications.
+            (async () => {
+                if (supplierEmail) {
+                    try {
+                        await sendTemplatedEmail(pool, sql, 'ETT004', supplierEmail, {
+                            supplierName:  companyName,
+                            tenderTitle,
+                            bidId,
+                            submittedDate: submittedDate || today,
+                            orgName:       process.env.ORG_NAME || 'Procurement Portal',
+                        });
+                    } catch (mailErr) {
+                        console.error('[mailer] Failed to send bid confirmation email:', mailErr.message);
+                    }
+                }
+
+                try {
+                    const adminIds = await getAdminUserIds(pool);
+                    for (const adminUserId of adminIds) {
+                        await createNotification(pool, {
+                            userId:   adminUserId,
+                            userType: 'admin',
+                            message:  `${companyName} submitted a bid for "${tenderTitle}".`,
+                            type:     'info',
+                            link:     `/admin/tenders/${tenderId}`,
+                        });
+                    }
+                } catch (notifErr) {
+                    console.error('[notify] Failed to notify admins of new bid:', notifErr.message);
+                }
+
+                if (warning) {
+                    try {
+                        await createNotification(pool, {
+                            userId:   supplierId,
+                            userType: 'supplier',
+                            message:  warning.message,
+                            type:     'warning',
+                            link:     '/supplier/documents',
+                        });
+                    } catch (notifErr) {
+                        console.error('[notify] Failed to send expired-document notice:', notifErr.message);
+                    }
+                }
+            })().catch(err => console.error('[post-submit] Unexpected background error:', err.message));
+
+            try {
+                await logAudit(pool, req, {
+                    action: 'BID_SUBMIT', entityType: 'Bid', entityId: bidId,
+                    description: `${companyName} submitted bid ${bidId} for tender "${tenderTitle}" (total ${computedGrandTotal})` +
+                                (expiredDocs.length ? ` with ${expiredDocs.length} expired document(s)` : ''),
+                });
+            } catch (auditErr) {
+                console.error('[audit] Failed to log bid submission:', auditErr.message);
+            }
 
             res.status(201).json({
                 message: 'Bid submitted successfully',
@@ -499,6 +532,194 @@ router.post('/', requireAuth, async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 });
+
+// ── DRAFTS  /api/bids/draft/:tenderId  — supplier: autosaved work-in-progress bid
+const requireSupplier = (req, res, next) =>
+    req.user?.role === 'supplier'
+        ? next()
+        : res.status(403).json({ message: 'Only suppliers can use bid drafts' });
+
+async function getTenderOpenState(pool, tenderId) {
+    const r = await pool.request()
+        .input('tenderId', sql.VarChar(50), tenderId)
+        .query(`
+            SELECT TenderStatusID,
+                   CASE WHEN ClosingDate IS NOT NULL AND ClosingDate <= GETDATE() THEN 1 ELSE 0 END AS IsPastClosing
+            FROM Tender WHERE TenderID = @tenderId
+        `);
+    if (r.recordset.length === 0) return { exists: false, open: false };
+    const t = r.recordset[0];
+    return { exists: true, open: t.TenderStatusID === 'TS002' && t.IsPastClosing === 0 };
+}
+
+router.get('/draft/:tenderId', requireAuth, requireSupplier, async (req, res) => {
+    const { tenderId }  = req.params;
+    const supplierId    = req.user.userId;
+    try {
+        const pool  = await getPool();
+        const state = await getTenderOpenState(pool, tenderId);
+        if (!state.exists) return res.status(404).json({ message: 'Tender not found' });
+        if (!state.open)   return res.json({ draft: null });
+
+        const bidExists = await pool.request()
+            .input('tenderId',   sql.VarChar(50), tenderId)
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`SELECT 1 FROM Bid WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+        if (bidExists.recordset.length > 0) return res.json({ draft: null });
+
+        const r = await pool.request()
+            .input('tenderId',   sql.VarChar(50), tenderId)
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`SELECT Payload, UpdatedAt FROM BidDraft WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+
+        if (r.recordset.length === 0) return res.json({ draft: null });
+
+        let entries = {};
+        try { entries = JSON.parse(r.recordset[0].Payload).entries || {}; } catch { /* corrupt draft: treat as empty */ }
+
+        res.json({ draft: { entries, updatedAt: r.recordset[0].UpdatedAt } });
+    } catch (error) {
+        console.error('[GET /api/bids/draft/:tenderId] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
+const sanitizeDraftEntries = (entries, validIds) => {
+    const clean = {};
+    for (const [tenderItemId, e] of Object.entries(entries)) {
+        if (!validIds.has(tenderItemId) || !e || typeof e !== 'object') continue;
+        const price = Number(e.unitPrice);
+        clean[tenderItemId] = {
+            included:        e.included !== false,
+            unitPrice:       Number.isFinite(price) && price > 0 ? price : 0,
+            countryOfOrigin: String(e.countryOfOrigin || '').slice(0, 100),
+            packSize:        String(e.packSize || '').slice(0, 100),
+            expiryDate:      /^\d{4}-\d{2}-\d{2}$/.test(String(e.expiryDate || '')) ? e.expiryDate : '',
+        };
+    }
+    return clean;
+};
+
+// Shared checks for PUT and PATCH. Sends the error response itself and returns null if a check fails.
+async function prepareDraftWrite(req, res, bodyKey) {
+    const { tenderId } = req.params;
+    const supplierId   = req.user.userId;
+    const input        = req.body?.[bodyKey];
+
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        res.status(400).json({ message: `${bodyKey} must be an object keyed by tenderItemId` });
+        return null;
+    }
+
+    const pool  = await getPool();
+    const state = await getTenderOpenState(pool, tenderId);
+    if (!state.exists) { res.status(404).json({ message: 'Tender not found' }); return null; }
+    if (!state.open)   { res.status(400).json({ message: 'This tender is no longer open for bidding' }); return null; }
+
+    const existing = await pool.request()
+        .input('tenderId',   sql.VarChar(50), tenderId)
+        .input('supplierId', sql.VarChar(50), supplierId)
+        .query(`SELECT 1 FROM Bid WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+    if (existing.recordset.length > 0) {
+        res.status(409).json({ message: 'A bid has already been submitted for this tender' });
+        return null;
+    }
+
+    const itemsRes = await pool.request()
+        .input('tenderId', sql.VarChar(50), tenderId)
+        .query(`SELECT TenderItemID FROM TenderItem WHERE TenderID = @tenderId`);
+    const validIds = new Set(itemsRes.recordset.map(r => r.TenderItemID));
+
+    return { pool, tenderId, supplierId, clean: sanitizeDraftEntries(input, validIds) };
+}
+
+const UPSERT_DRAFT_SQL = `
+    MERGE BidDraft WITH (HOLDLOCK) AS target
+    USING (SELECT @supplierId AS SupplierID, @tenderId AS TenderID) AS src
+       ON target.SupplierID = src.SupplierID AND target.TenderID = src.TenderID
+    WHEN MATCHED THEN
+        UPDATE SET Payload = @payload, UpdatedAt = GETDATE()
+    WHEN NOT MATCHED THEN
+        INSERT (SupplierID, TenderID, Payload, CreatedAt, UpdatedAt)
+        VALUES (@supplierId, @tenderId, @payload, GETDATE(), GETDATE())
+    OUTPUT inserted.UpdatedAt;
+`;
+
+// PUT: replace the whole draft (used later by the Excel import)
+router.put('/draft/:tenderId', requireAuth, requireSupplier, async (req, res) => {
+    try {
+        const ctx = await prepareDraftWrite(req, res, 'entries');
+        if (!ctx) return;
+
+        const result = await ctx.pool.request()
+            .input('tenderId',   sql.VarChar(50),       ctx.tenderId)
+            .input('supplierId', sql.VarChar(50),       ctx.supplierId)
+            .input('payload',    sql.NVarChar(sql.MAX), JSON.stringify({ entries: ctx.clean }))
+            .query(UPSERT_DRAFT_SQL);
+
+        res.json({ message: 'Draft saved', updatedAt: result.recordset[0].UpdatedAt });
+    } catch (error) {
+        console.error('[PUT /api/bids/draft/:tenderId] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// PATCH: merge only the changed items into the stored draft (used by autosave)
+router.patch('/draft/:tenderId', requireAuth, requireSupplier, async (req, res) => {
+    try {
+        const ctx = await prepareDraftWrite(req, res, 'changes');
+        if (!ctx) return;
+        const { pool, tenderId, supplierId, clean } = ctx;
+
+        const tx = new sql.Transaction(pool);
+        await tx.begin();
+        try {
+            const cur = await tx.request()
+                .input('tenderId',   sql.VarChar(50), tenderId)
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .query(`
+                    SELECT Payload FROM BidDraft WITH (UPDLOCK, HOLDLOCK)
+                    WHERE TenderID = @tenderId AND SupplierID = @supplierId
+                `);
+
+            let entries = {};
+            if (cur.recordset.length > 0) {
+                try { entries = JSON.parse(cur.recordset[0].Payload).entries || {}; } catch { /* corrupt: start fresh */ }
+            }
+            Object.assign(entries, clean);
+
+            const result = await tx.request()
+                .input('tenderId',   sql.VarChar(50),       tenderId)
+                .input('supplierId', sql.VarChar(50),       supplierId)
+                .input('payload',    sql.NVarChar(sql.MAX), JSON.stringify({ entries }))
+                .query(UPSERT_DRAFT_SQL);
+
+            await tx.commit();
+            res.json({ message: 'Draft saved', updatedAt: result.recordset[0].UpdatedAt });
+        } catch (err) {
+            await tx.rollback();
+            throw err;
+        }
+    } catch (error) {
+        console.error('[PATCH /api/bids/draft/:tenderId] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
+router.delete('/draft/:tenderId', requireAuth, requireSupplier, async (req, res) => {
+    try {
+        const pool = await getPool();
+        await pool.request()
+            .input('tenderId',   sql.VarChar(50), req.params.tenderId)
+            .input('supplierId', sql.VarChar(50), req.user.userId)
+            .query(`DELETE FROM BidDraft WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+        res.json({ message: 'Draft discarded' });
+    } catch (error) {
+        console.error('[DELETE /api/bids/draft/:tenderId] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
 
 // ── 5. PATCH /api/bids/:id/status  — admin: award / reject
 router.patch('/:id/status', requireAdmin, async (req, res) => {
@@ -783,146 +1004,214 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
             `);
         const items = itemsResult.recordset;
 
+        // ── Helpers ───────────────────────────────────────────────────────────
         const fmtDate = (d) => {
             if (!d) return '-';
             const dt = new Date(d);
             return isNaN(dt.getTime()) ? '-' : dt.toISOString().slice(0, 10);
         };
+        const money = (n) =>
+            'GHS ' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const val = (v) => (v === null || v === undefined || String(v).trim() === '') ? '-' : String(v);
 
-        const doc = new PDFDocument({ margin: 50, size: 'A4' });
+        const ORG = process.env.ORG_NAME || 'Procurement Portal';
+        const C = {
+            accent: '#C2571A',
+            dark:   '#1F2937',
+            mid:    '#6B7280',
+            line:   '#D1D5DB',
+        };
+        const L = 50, R = 545, W = 495;
+        const PAGE_LIMIT = 765;
+
+        const hline = (x1, x2, y, width, color) => {
+            doc.moveTo(x1, y).lineTo(x2, y).lineWidth(width).strokeColor(color).stroke();
+            doc.lineWidth(1);
+        };
+
+        const doc = new PDFDocument({
+            margin: 50,
+            size: 'A4',
+            bufferPages: true,
+            info: { Title: `Bid Receipt ${bid.BidID}`, Author: ORG },
+        });
 
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `inline; filename="Bid_${bidId}_Receipt.pdf"`);
         doc.pipe(res);
 
-        // Logo (top left, same band as the title)
+        // ── Header ────────────────────────────────────────────────────────────
         const logoPath = path.join(__dirname, '..', 'assets', 'logo.png');
-        const headerY  = doc.y;
+        let logoOk = false;
         if (fs.existsSync(logoPath)) {
             try {
-                doc.image(logoPath, 50, 40, { fit: [70, 55] });
+                doc.image(logoPath, L, 36, { fit: [190, 78] });
+                logoOk = true;
             } catch (logoErr) {
                 console.error('[Download Bid PDF] Logo failed to load:', logoErr.message);
             }
-            doc.y = headerY;
+        }
+        if (!logoOk) {
+            doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(16)
+               .text(ORG, L, 60, { lineBreak: false });
         }
 
-        // Header
-        doc.fontSize(20).font('Helvetica-Bold').text('BID CONFIRMATION RECEIPT', { align: 'center' });
-        doc.moveDown();
-        doc.fontSize(10).font('Helvetica').text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
-        doc.moveDown(2);
+        doc.fillColor(C.mid).font('Helvetica').fontSize(8.5)
+           .text(ORG.toUpperCase(), 250, 48, { width: 295, align: 'right', characterSpacing: 1, lineBreak: false });
+        doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(18)
+           .text('Bid Confirmation Receipt', 250, 62, { width: 295, align: 'right', lineBreak: false });
+        doc.fillColor(C.mid).font('Helvetica').fontSize(8.5)
+           .text(`Generated ${new Date().toLocaleString('en-GB')}`, 250, 88, { width: 295, align: 'right', lineBreak: false });
 
-        // Reference box
-        const refBoxTop = doc.y;
-        doc.rect(50, refBoxTop, 495, 60).stroke();
-        doc.fontSize(10).font('Helvetica-Bold').text('BID REFERENCE:', 60, refBoxTop + 10);
-        doc.font('Helvetica').text(bid.BidID, 60, refBoxTop + 25);
-        doc.font('Helvetica-Bold').text('SUBMITTED DATE:', 300, refBoxTop + 10);
-        doc.font('Helvetica').text(fmtDate(bid.SubmittedDate), 300, refBoxTop + 25);
-        doc.font('Helvetica-Bold').text('STATUS:', 60, refBoxTop + 40);
-        const statusColor = bid.Status === 'Awarded' ? 'green' : (bid.Status === 'Rejected' ? 'red' : 'orange');
-        doc.fillColor(statusColor).text(bid.Status, 120, refBoxTop + 40).fillColor('black');
-        doc.y = refBoxTop + 60;
-        doc.moveDown(1);
+        hline(L, R, 128, 1.5, C.accent);
 
-        // Tender details
-        doc.x = 50;
-        doc.fontSize(14).font('Helvetica-Bold').text('TENDER DETAILS', { underline: true });
-        doc.moveDown(0.5);
-        doc.fontSize(10).font('Helvetica');
-        const tY = doc.y;
-        doc.font('Helvetica-Bold').text('Tender ID:',    50, tY);      doc.font('Helvetica').text(bid.TenderID,     150, tY);
-        doc.font('Helvetica-Bold').text('Category:',    300, tY);      doc.font('Helvetica').text(bid.CategoryName, 380, tY);
-        doc.font('Helvetica-Bold').text('Title:',        50, tY + 20); doc.font('Helvetica').text(bid.Title,        150, tY + 20);
-        doc.font('Helvetica-Bold').text('Closing Date:', 50, tY + 40); doc.font('Helvetica').text(fmtDate(bid.ClosingDate), 150, tY + 40);
-        doc.font('Helvetica-Bold').text('Est. Budget:', 300, tY + 40); doc.font('Helvetica').text(`GHS ${parseFloat(bid.EstimatedBudget).toFixed(2)}`, 430, tY + 40);
-        doc.moveDown(4);
+        // ── Reference row ─────────────────────────────────────────────────────
+        const metaY = 148;
+        const statusColors = { Awarded: '#15803D', Rejected: '#B91C1C' };
+        const statusColor  = statusColors[bid.Status] || '#B45309';
 
-        // Supplier details
-        doc.x = 50;
-        doc.fontSize(14).font('Helvetica-Bold').text('SUPPLIER DETAILS', { underline: true });
-        doc.moveDown(0.5);
-        doc.fontSize(10).font('Helvetica');
-        const sY = doc.y;
-        doc.font('Helvetica-Bold').text('Company Name:', 50, sY);      doc.font('Helvetica').text(bid.CompanyName,        160, sY);
-        doc.font('Helvetica-Bold').text('Reg Number:',  300, sY);      doc.font('Helvetica').text(bid.RegistrationNumber, 400, sY);
-        doc.font('Helvetica-Bold').text('Contact:',      50, sY + 20); doc.font('Helvetica').text(bid.ContactPerson,      160, sY + 20);
-        doc.font('Helvetica-Bold').text('Email:',       300, sY + 20); doc.font('Helvetica').text(bid.Email,              350, sY + 20);
-        doc.font('Helvetica-Bold').text('Phone:',        50, sY + 40); doc.font('Helvetica').text(bid.Phone   || '-',     100, sY + 40);
-        doc.font('Helvetica-Bold').text('Address:',     300, sY + 40); doc.font('Helvetica').text(bid.Address || '-',     360, sY + 40);
-        doc.moveDown(4);
+        const metaLabel = (text, x) =>
+            doc.fillColor(C.mid).font('Helvetica-Bold').fontSize(7.5)
+               .text(text, x, metaY, { characterSpacing: 0.8, lineBreak: false });
+        const metaValue = (text, x, color) =>
+            doc.fillColor(color || C.dark).font('Helvetica-Bold').fontSize(11)
+               .text(text, x, metaY + 13, { lineBreak: false });
 
-        // Items table
-        doc.x = 50;
-        doc.fontSize(14).font('Helvetica-Bold').text('BID ITEMS', { underline: true });
-        doc.moveDown(0.5);
+        metaLabel('BID REFERENCE', 50);  metaValue(val(bid.BidID), 50);
+        metaLabel('SUBMITTED',    230);  metaValue(fmtDate(bid.SubmittedDate), 230);
+        metaLabel('STATUS',       400);  metaValue(val(bid.Status), 400, statusColor);
 
-        const cols      = [50, 95, 280, 335, 385, 460];
-        const colWidths = [40, 180, 50, 45, 70, 85];
-        const PAGE_LIMIT = 720;
+        hline(L, R, 190, 0.5, C.line);
 
-        const drawTableHeader = (y) => {
-            doc.fontSize(9).font('Helvetica-Bold').fillColor('black');
-            doc.text('Item #',      cols[0], y, { width: colWidths[0] });
-            doc.text('Description', cols[1], y, { width: colWidths[1] });
-            doc.text('Unit',        cols[2], y, { width: colWidths[2] });
-            doc.text('Quantity',    cols[3], y, { width: colWidths[3], align: 'right' });
-            doc.text('Unit Price',  cols[4], y, { width: colWidths[4], align: 'right' });
-            doc.text('Total',       cols[5], y, { width: colWidths[5], align: 'right' });
-            doc.moveTo(50, y + 15).lineTo(545, y + 15).stroke();
-            return y + 25;
+        // ── Tender and supplier details ───────────────────────────────────────
+        const drawKV = (x, y, title, fields) => {
+            doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(8.5)
+               .text(title, x, y, { characterSpacing: 1, lineBreak: false });
+            hline(x, x + 235, y + 16, 0.75, C.dark);
+
+            let cy = y + 26;
+            fields.forEach(([label, value]) => {
+                doc.font('Helvetica').fontSize(9);
+                const h = Math.max(12, doc.heightOfString(value, { width: 155 }));
+                doc.fillColor(C.mid).font('Helvetica').fontSize(8.5)
+                   .text(label, x, cy + 0.5, { width: 76, lineBreak: false });
+                doc.fillColor(C.dark).font('Helvetica').fontSize(9)
+                   .text(value, x + 80, cy, { width: 155 });
+                cy += h + 8;
+            });
+            return cy;
         };
 
-        let curY = drawTableHeader(doc.y);
+        const detailY = 208;
+        const tenderEnd = drawKV(L, detailY, 'TENDER', [
+            ['Tender ID',    val(bid.TenderID)],
+            ['Title',        val(bid.Title)],
+            ['Category',     val(bid.CategoryName)],
+            ['Closing date', fmtDate(bid.ClosingDate)],
+            ['Est. budget',  money(bid.EstimatedBudget)],
+        ]);
+        const supplierEnd = drawKV(310, detailY, 'SUPPLIER', [
+            ['Company',     val(bid.CompanyName)],
+            ['Reg. number', val(bid.RegistrationNumber)],
+            ['Contact',     val(bid.ContactPerson)],
+            ['Email',       val(bid.Email)],
+            ['Phone',       val(bid.Phone)],
+            ['Address',     val(bid.Address)],
+        ]);
+        const detailEnd = Math.max(tenderEnd, supplierEnd);
 
-        items.forEach(item => {
-            const description = item.Description || '';
-            doc.fontSize(9).font('Helvetica');
-            const descHeight = doc.heightOfString(description, { width: colWidths[1] });
-            const mainHeight = Math.max(14, descHeight + 2);
-            const detailGap  = 12;
-            const rowHeight  = mainHeight + detailGap + 6;
+        // ── Items table ───────────────────────────────────────────────────────
+        const itemsY = detailEnd + 22;
+        doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(8.5)
+           .text('BID ITEMS', L, itemsY, { characterSpacing: 1, lineBreak: false });
+
+        const cols      = [50, 76, 276, 322, 368, 458];
+        const colWidths = [26, 200, 46, 46, 90, 87];
+        const cell = (i, text, y, align) =>
+            doc.text(text, cols[i], y, {
+                width: colWidths[i] - (i === 5 ? 0 : 8),
+                align: align || 'left',
+                lineBreak: false,
+            });
+
+        const drawTableHeader = (y) => {
+            doc.fillColor(C.mid).font('Helvetica-Bold').fontSize(7.5);
+            cell(0, '#',          y + 4);
+            cell(1, 'DESCRIPTION', y + 4);
+            cell(2, 'UNIT',       y + 4);
+            cell(3, 'QTY',        y + 4, 'right');
+            cell(4, 'UNIT PRICE', y + 4, 'right');
+            cell(5, 'TOTAL',      y + 4, 'right');
+            hline(L, R, y + 18, 1, C.dark);
+            return y + 18;
+        };
+
+        let curY = drawTableHeader(itemsY + 20);
+
+        items.forEach((item) => {
+            const description = val(item.Description);
+            doc.font('Helvetica').fontSize(9);
+            const descHeight = doc.heightOfString(description, { width: colWidths[1] - 8 });
+            const mainHeight = Math.max(12, descHeight);
+            const rowHeight  = 8 + mainHeight + 3 + 10 + 8;
 
             if (curY + rowHeight > PAGE_LIMIT) {
                 doc.addPage();
                 curY = drawTableHeader(50);
             }
 
-            // Main row
-            doc.fontSize(9).font('Helvetica').fillColor('black');
-            doc.text(item.ItemNo.toString(),                         cols[0], curY, { width: colWidths[0] });
-            doc.text(description,                                    cols[1], curY, { width: colWidths[1] });
-            doc.text(item.Unit || '',                                cols[2], curY, { width: colWidths[2] });
-            doc.text(item.Quantity.toString(),                       cols[3], curY, { width: colWidths[3], align: 'right' });
-            doc.text(`GHS ${parseFloat(item.UnitPrice).toFixed(2)}`, cols[4], curY, { width: colWidths[4], align: 'right' });
-            doc.text(`GHS ${parseFloat(item.Total).toFixed(2)}`,     cols[5], curY, { width: colWidths[5], align: 'right' });
+            const ty = curY + 8;
+            doc.fillColor(C.mid).font('Helvetica').fontSize(9);
+            cell(0, String(item.ItemNo), ty);
 
-            // Detail line: origin, pack size, expiry
-            doc.fontSize(8).font('Helvetica').fillColor('#555555');
-            doc.text(
-                `Origin: ${item.CountryOfOrigin || '-'}     Pack size: ${item.PackSize || '-'}     Expiry: ${fmtDate(item.ExpiryDate)}`,
-                cols[1], curY + mainHeight,
-                { width: 445 }
+            doc.fillColor(C.dark).font('Helvetica').fontSize(9);
+            doc.text(description, cols[1], ty, { width: colWidths[1] - 8 });
+            cell(2, val(item.Unit), ty);
+            cell(3, Number(item.Quantity).toLocaleString('en-US'), ty, 'right');
+            cell(4, money(item.UnitPrice), ty, 'right');
+            doc.font('Helvetica-Bold');
+            cell(5, money(item.Total), ty, 'right');
+
+            doc.fillColor(C.mid).font('Helvetica').fontSize(7.5).text(
+                `Origin: ${val(item.CountryOfOrigin)}   |   Pack size: ${val(item.PackSize)}   |   Expiry: ${fmtDate(item.ExpiryDate)}`,
+                cols[1], ty + mainHeight + 3,
+                { width: 400, lineBreak: false }
             );
-            doc.fillColor('black');
 
+            hline(L, R, curY + rowHeight, 0.5, C.line);
             curY += rowHeight;
         });
 
-        // Grand total
-        if (curY + 40 > PAGE_LIMIT) {
+        // ── Totals ────────────────────────────────────────────────────────────
+        if (curY + 80 > PAGE_LIMIT) {
             doc.addPage();
             curY = 50;
         }
-        curY += 10;
-        doc.moveTo(350, curY - 5).lineTo(545, curY - 5).stroke();
-        doc.fontSize(12).font('Helvetica-Bold').fillColor('black');
-        doc.text('GRAND TOTAL:', 350, curY);
-        doc.text(`GHS ${parseFloat(bid.GrandTotal).toFixed(2)}`, 450, curY, { width: 95, align: 'right' });
+        curY += 16;
 
-        doc.fontSize(8).font('Helvetica')
-            .text('This is a system-generated receipt. Please retain for your records.', 50, 750, { align: 'center' });
+        doc.fillColor(C.mid).font('Helvetica').fontSize(9)
+           .text('Items bid', 330, curY, { width: 100, lineBreak: false });
+        doc.fillColor(C.dark).font('Helvetica').fontSize(9)
+           .text(String(items.length), 330, curY, { width: 215, align: 'right', lineBreak: false });
+
+        hline(330, R, curY + 20, 1.5, C.accent);
+
+        doc.fillColor(C.dark).font('Helvetica-Bold').fontSize(10)
+           .text('Grand total', 330, curY + 31, { width: 100, lineBreak: false });
+        doc.fontSize(15)
+           .text(money(bid.GrandTotal), 330, curY + 28, { width: 215, align: 'right', lineBreak: false });
+
+        // ── Footer on every page ──────────────────────────────────────────────
+        const range = doc.bufferedPageRange();
+        for (let i = range.start; i < range.start + range.count; i++) {
+            doc.switchToPage(i);
+            doc.page.margins.bottom = 0;
+
+            hline(L, R, 792, 0.5, C.line);
+            doc.fillColor(C.mid).font('Helvetica').fontSize(7.5);
+            doc.text(`${ORG}   |   System-generated receipt. Please retain for your records.`, L, 802, { width: 380, lineBreak: false });
+            doc.text(`Page ${i - range.start + 1} of ${range.count}`, 445, 802, { width: 100, align: 'right', lineBreak: false });
+        }
 
         doc.end();
 
@@ -932,7 +1221,6 @@ router.get('/:bidId/download', requireAuth, async (req, res) => {
         else res.end();
     }
 });
-
 
 // ── 7. GET /api/bids/:bidId  — single bid with items
 router.get('/:bidId', requireAuth, async (req, res) => {
