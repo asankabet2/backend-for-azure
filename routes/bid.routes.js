@@ -5,6 +5,8 @@ const router     = express.Router();
 const PDFDocument = require('pdfkit');
 const path = require('path');
 const fs   = require('fs');
+const multer = require('multer');
+const bidXlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const { requireAuth, requireAdmin }   = require('../middleware/auth');
 const { getPool, sql }                = require('../db/procurement');
@@ -13,6 +15,7 @@ const { generateId }                  = require('../utils/idGenerator');
 const { logAudit }                    = require('../helpers/audit');
 const { sendTemplatedEmail }          = require('../helpers/mailers');
 const { checkAwardEligibility }       = require('../helpers/evaluationHelpers');
+const { buildBidTemplate, parseBidTemplate, ImportError } = require('../helpers/bidExcel');
 
 
 
@@ -644,6 +647,149 @@ const UPSERT_DRAFT_SQL = `
         VALUES (@supplierId, @tenderId, @payload, GETDATE(), GETDATE())
     OUTPUT inserted.UpdatedAt;
 `;
+
+async function readDraftEntries(pool, tenderId, supplierId) {
+    const r = await pool.request()
+        .input('tenderId',   sql.VarChar(50), tenderId)
+        .input('supplierId', sql.VarChar(50), supplierId)
+        .query(`SELECT Payload FROM BidDraft WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+    if (r.recordset.length === 0) return {};
+    try { return JSON.parse(r.recordset[0].Payload).entries || {}; } catch { return {}; }
+}
+
+// Same locking pattern as the PATCH route, reusable
+async function mergeDraftEntries(pool, tenderId, supplierId, clean) {
+    const tx = new sql.Transaction(pool);
+    await tx.begin();
+    try {
+        const cur = await tx.request()
+            .input('tenderId',   sql.VarChar(50), tenderId)
+            .input('supplierId', sql.VarChar(50), supplierId)
+            .query(`
+                SELECT Payload FROM BidDraft WITH (UPDLOCK, HOLDLOCK)
+                WHERE TenderID = @tenderId AND SupplierID = @supplierId
+            `);
+        let entries = {};
+        if (cur.recordset.length > 0) {
+            try { entries = JSON.parse(cur.recordset[0].Payload).entries || {}; } catch { /* start fresh */ }
+        }
+        Object.assign(entries, clean);
+
+        const result = await tx.request()
+            .input('tenderId',   sql.VarChar(50),       tenderId)
+            .input('supplierId', sql.VarChar(50),       supplierId)
+            .input('payload',    sql.NVarChar(sql.MAX), JSON.stringify({ entries }))
+            .query(UPSERT_DRAFT_SQL);
+
+        await tx.commit();
+        return result.recordset[0].UpdatedAt;
+    } catch (err) {
+        await tx.rollback();
+        throw err;
+    }
+}
+
+// GET /api/bids/template/:tenderId  — download the Excel template, pre-filled from the supplier's draft
+router.get('/template/:tenderId', requireAuth, requireSupplier, async (req, res) => {
+    const { tenderId } = req.params;
+    try {
+        const pool = await getPool();
+
+        const t = await pool.request()
+            .input('tenderId', sql.VarChar(50), tenderId)
+            .query(`
+                SELECT TenderID, Title, ClosingDate, TenderStatusID,
+                       CASE WHEN ClosingDate IS NOT NULL AND ClosingDate <= GETDATE() THEN 1 ELSE 0 END AS IsPastClosing
+                FROM Tender WHERE TenderID = @tenderId
+            `);
+        if (t.recordset.length === 0) return res.status(404).json({ message: 'Tender not found' });
+        const tr = t.recordset[0];
+        if (tr.TenderStatusID !== 'TS002' || tr.IsPastClosing === 1)
+            return res.status(400).json({ message: 'This tender is not open for bidding' });
+
+        const itemsRes = await pool.request()
+            .input('tenderId', sql.VarChar(50), tenderId)
+            .query(`
+                SELECT TenderItemID, ItemNo, Description, Unit, Quantity
+                FROM TenderItem WHERE TenderID = @tenderId ORDER BY ItemNo ASC
+            `);
+
+        const entries = await readDraftEntries(pool, tenderId, req.user.userId);
+
+        const wb = await buildBidTemplate({
+            tender:  { id: tr.TenderID, title: tr.Title, closingDate: tr.ClosingDate ? new Date(tr.ClosingDate).toISOString() : '' },
+            items:   itemsRes.recordset.map(r => ({
+                tenderItemId: r.TenderItemID, itemNo: r.ItemNo,
+                description:  r.Description,  unit: r.Unit, quantity: r.Quantity,
+            })),
+            entries,
+            org: process.env.ORG_NAME || 'Procurement Portal',
+        });
+
+        const buf = Buffer.from(await wb.xlsx.writeBuffer());
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="Bid_Template_${tenderId}.xlsx"`);
+        res.send(buf);
+    } catch (error) {
+        console.error('[GET /api/bids/template/:tenderId] Error:', error);
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// POST /api/bids/draft/:tenderId/import  — merge an uploaded template into the supplier's draft
+router.post('/draft/:tenderId/import', requireAuth, requireSupplier,
+    (req, res, next) => bidXlsxUpload.single('file')(req, res, (err) => {
+        if (!err) return next();
+        res.status(400).json({ message: err.code === 'LIMIT_FILE_SIZE' ? 'File is too large (maximum 5 MB).' : err.message });
+    }),
+    async (req, res) => {
+        const { tenderId } = req.params;
+        const supplierId   = req.user.userId;
+        try {
+            if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+            if (!/\.xlsx$/i.test(req.file.originalname || ''))
+                return res.status(400).json({ message: 'Please upload an .xlsx file (save it as "Excel Workbook").' });
+
+            const pool  = await getPool();
+            const state = await getTenderOpenState(pool, tenderId);
+            if (!state.exists) return res.status(404).json({ message: 'Tender not found' });
+            if (!state.open)   return res.status(400).json({ message: 'This tender is no longer open for bidding' });
+
+            const existing = await pool.request()
+                .input('tenderId',   sql.VarChar(50), tenderId)
+                .input('supplierId', sql.VarChar(50), supplierId)
+                .query(`SELECT 1 FROM Bid WHERE TenderID = @tenderId AND SupplierID = @supplierId`);
+            if (existing.recordset.length > 0)
+                return res.status(409).json({ message: 'A bid has already been submitted for this tender' });
+
+            const itemsRes = await pool.request()
+                .input('tenderId', sql.VarChar(50), tenderId)
+                .query(`SELECT TenderItemID, ItemNo FROM TenderItem WHERE TenderID = @tenderId`);
+            const items   = itemsRes.recordset.map(r => ({ tenderItemId: r.TenderItemID, itemNo: r.ItemNo }));
+            const current = await readDraftEntries(pool, tenderId, supplierId);
+
+            const parsed = await parseBidTemplate(req.file.buffer, { tenderId, items, current });
+            const clean  = sanitizeDraftEntries(parsed.entries, new Set(items.map(i => i.tenderItemId)));
+
+            let updatedAt = null;
+            if (Object.keys(clean).length > 0)
+                updatedAt = await mergeDraftEntries(pool, tenderId, supplierId, clean);
+
+            res.json({
+                message:      'Import complete',
+                imported:     Object.keys(clean).length,
+                unchanged:    parsed.skipped,
+                problemCount: parsed.problems.length,
+                problems:     parsed.problems.slice(0, 100),
+                updatedAt,
+            });
+        } catch (error) {
+            if (error instanceof ImportError) return res.status(400).json({ message: error.message });
+            console.error('[POST /api/bids/draft/:tenderId/import] Error:', error);
+            res.status(500).json({ message: error.message });
+        }
+    }
+);
 
 // PUT: replace the whole draft (used later by the Excel import)
 router.put('/draft/:tenderId', requireAuth, requireSupplier, async (req, res) => {
